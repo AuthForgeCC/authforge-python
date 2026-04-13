@@ -6,6 +6,7 @@ import os
 import platform
 import secrets
 import subprocess
+import socket
 import threading
 import time
 import urllib.error
@@ -15,6 +16,24 @@ from typing import Any, Callable, Dict, Optional
 
 
 DEFAULT_API_BASE_URL = "https://auth.authforge.cc"
+RATE_LIMIT_RETRY_DELAYS = (2, 5)
+NETWORK_RETRY_DELAY = 2
+KNOWN_SERVER_ERRORS = {
+    "invalid_app",
+    "invalid_key",
+    "expired",
+    "revoked",
+    "hwid_mismatch",
+    "no_credits",
+    "blocked",
+    "rate_limited",
+    "replay_detected",
+    "app_disabled",
+    "session_expired",
+    "bad_request",
+    "checksum_required",
+    "checksum_mismatch",
+}
 
 
 class AuthForgeClient:
@@ -49,6 +68,7 @@ class AuthForgeClient:
         self._lock = threading.Lock()
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_started = False
+        self._heartbeat_stop = threading.Event()
 
         self._license_key: Optional[str] = None
         self._session_token: Optional[str] = None
@@ -57,6 +77,10 @@ class AuthForgeClient:
         self._raw_payload_b64: Optional[str] = None
         self._signature: Optional[str] = None
         self._derived_key: Optional[bytes] = None
+        self._session_data: Optional[Dict[str, Any]] = None
+        self._app_variables: Optional[Dict[str, Any]] = None
+        self._license_variables: Optional[Dict[str, Any]] = None
+        self._authenticated = False
         self._hwid = self._get_hwid()
 
     def login(self, license_key: str) -> bool:
@@ -75,6 +99,7 @@ class AuthForgeClient:
         with self._lock:
             if self._heartbeat_started:
                 return
+            self._heartbeat_stop.clear()
             self._heartbeat_started = True
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop,
@@ -84,8 +109,7 @@ class AuthForgeClient:
             self._heartbeat_thread.start()
 
     def _heartbeat_loop(self) -> None:
-        while True:
-            time.sleep(self.heartbeat_interval)
+        while not self._heartbeat_stop.wait(self.heartbeat_interval):
             try:
                 if self.heartbeat_mode == "SERVER":
                     self._server_heartbeat()
@@ -102,15 +126,15 @@ class AuthForgeClient:
         if not session_token:
             raise RuntimeError("missing_session_token")
 
-        nonce = self._generate_nonce()
         body = {
             "appId": self.app_id,
             "sessionToken": session_token,
-            "nonce": nonce,
+            "nonce": self._generate_nonce(),
             "hwid": hwid,
         }
         response_obj = self._post_json("/auth/heartbeat", body)
-        self._apply_signed_response(response_obj, expected_nonce=nonce, license_key=None)
+        expected_nonce = str(body.get("nonce", "")).strip()
+        self._apply_signed_response(response_obj, expected_nonce=expected_nonce, license_key=None)
 
     def _local_heartbeat(self) -> None:
         with self._lock:
@@ -118,8 +142,6 @@ class AuthForgeClient:
             signature = self._signature
             derived_key = self._derived_key
             expires_in = self._session_expires_in
-            license_key = self._license_key
-
         if not raw_payload_b64 or not signature or not derived_key:
             raise RuntimeError("missing_local_verification_state")
 
@@ -129,25 +151,20 @@ class AuthForgeClient:
             raise RuntimeError("missing_session_expiry")
 
         now = int(time.time())
-        if now < int(expires_in):
-            return
-
-        if not license_key:
-            raise RuntimeError("missing_license_key_for_refresh")
-
-        self._validate_and_store(license_key)
+        if now >= int(expires_in):
+            raise RuntimeError("session_expired")
 
     def _validate_and_store(self, license_key: str) -> None:
-        nonce = self._generate_nonce()
         body = {
             "appId": self.app_id,
             "appSecret": self.app_secret,
             "licenseKey": license_key,
             "hwid": self._hwid,
-            "nonce": nonce,
+            "nonce": self._generate_nonce(),
         }
         response_obj = self._post_json("/auth/validate", body)
-        self._apply_signed_response(response_obj, expected_nonce=nonce, license_key=license_key)
+        expected_nonce = str(body.get("nonce", "")).strip()
+        self._apply_signed_response(response_obj, expected_nonce=expected_nonce, license_key=license_key)
 
     def _apply_signed_response(
         self,
@@ -157,7 +174,8 @@ class AuthForgeClient:
     ) -> None:
         status = response_obj.get("status")
         if not self._is_success_status(status):
-            raise ValueError(f"auth_status_not_success: {status!r}")
+            error_code = self._extract_server_error(response_obj)
+            raise ValueError(error_code)
 
         raw_payload_b64 = self._require_str(response_obj, "payload")
         signature = self._require_str(response_obj, "signature")
@@ -192,29 +210,64 @@ class AuthForgeClient:
             self._raw_payload_b64 = raw_payload_b64
             self._signature = signature
             self._derived_key = derived_key
+            self._session_data = dict(payload_json)
+            self._app_variables = self._extract_optional_map(payload_json.get("appVariables"))
+            self._license_variables = self._extract_optional_map(payload_json.get("licenseVariables"))
+            self._authenticated = True
 
     def _post_json(self, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
         url = f"{self.api_base_url}{path}"
-        payload_bytes = json.dumps(data, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(
-            url=url,
-            data=payload_bytes,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
-                raw_response = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read().decode("utf-8")
-            except Exception:
-                detail = str(exc)
-            raise RuntimeError(f"http_error_{exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"url_error: {exc.reason}") from exc
+        body = dict(data)
+        rate_attempt = 0
+        while True:
+            if rate_attempt > 0 and "nonce" in body:
+                body["nonce"] = self._generate_nonce()
 
+            network_attempt = 0
+            while True:
+                payload_bytes = json.dumps(body, separators=(",", ":")).encode("utf-8")
+                request = urllib.request.Request(
+                    url=url,
+                    data=payload_bytes,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+                        raw_response = response.read().decode("utf-8")
+                    obj = self._parse_response_object(raw_response)
+                    data.clear()
+                    data.update(body)
+                    break
+                except urllib.error.HTTPError as exc:
+                    detail = ""
+                    parsed: Optional[Dict[str, Any]] = None
+                    try:
+                        detail = exc.read().decode("utf-8")
+                        parsed = self._parse_response_object(detail)
+                    except Exception:
+                        detail = str(exc)
+                    if parsed is not None:
+                        obj = parsed
+                        data.clear()
+                        data.update(body)
+                        break
+                    raise RuntimeError(f"http_error_{exc.code}: {detail}") from exc
+                except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+                    if network_attempt == 0:
+                        network_attempt += 1
+                        time.sleep(NETWORK_RETRY_DELAY)
+                        continue
+                    self._fail("network_error", exc)
+                    raise RuntimeError(f"url_error: {exc}") from exc
+
+            if self._extract_server_error(obj) == "rate_limited" and rate_attempt < len(RATE_LIMIT_RETRY_DELAYS):
+                time.sleep(RATE_LIMIT_RETRY_DELAYS[rate_attempt])
+                rate_attempt += 1
+                continue
+            return obj
+
+    def _parse_response_object(self, raw_response: str) -> Dict[str, Any]:
         try:
             obj = json.loads(raw_response)
         except json.JSONDecodeError as exc:
@@ -344,6 +397,20 @@ class AuthForgeClient:
             raise ValueError(f"empty_{key}")
         return text
 
+    def _extract_server_error(self, obj: Dict[str, Any]) -> str:
+        raw_error = str(obj.get("error", "")).strip().lower()
+        if raw_error in KNOWN_SERVER_ERRORS:
+            return raw_error
+        status = str(obj.get("status", "")).strip().lower()
+        if status in KNOWN_SERVER_ERRORS:
+            return status
+        return "unknown_error"
+
+    def _extract_optional_map(self, value: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(value, dict):
+            return dict(value)
+        return None
+
     def _fail(self, reason: str, exc: Optional[Exception] = None) -> None:
         if self.on_failure is not None:
             try:
@@ -352,3 +419,36 @@ class AuthForgeClient:
             except Exception:
                 pass
         os._exit(1)
+
+    def logout(self) -> None:
+        self._heartbeat_stop.set()
+        with self._lock:
+            self._license_key = None
+            self._session_token = None
+            self._session_expires_in = None
+            self._last_nonce = None
+            self._raw_payload_b64 = None
+            self._signature = None
+            self._derived_key = None
+            self._session_data = None
+            self._app_variables = None
+            self._license_variables = None
+            self._authenticated = False
+            self._heartbeat_started = False
+            self._heartbeat_thread = None
+
+    def is_authenticated(self) -> bool:
+        with self._lock:
+            return self._authenticated and bool(self._session_token)
+
+    def get_session_data(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._session_data) if self._session_data is not None else None
+
+    def get_app_variables(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._app_variables) if self._app_variables is not None else None
+
+    def get_license_variables(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._license_variables) if self._license_variables is not None else None

@@ -39,15 +39,34 @@ else:
 | `on_failure` | callable | `None` | Callback `(reason: str, exc: Exception | None)` on auth failure |
 | `request_timeout` | int | `15` | HTTP request timeout in seconds |
 
+## Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `login(license_key)` | `bool` | Validates key and stores signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
+| `logout()` | `None` | Stops heartbeat and clears all session/auth state |
+| `is_authenticated()` | `bool` | True when an active authenticated session exists |
+| `get_session_data()` | `dict \| None` | Full decoded payload map |
+| `get_app_variables()` | `dict \| None` | App-scoped variables map |
+| `get_license_variables()` | `dict \| None` | License-scoped variables map |
+
 ## Heartbeat Modes
 
-**SERVER** — The SDK pings the AuthForge API every `heartbeat_interval` seconds with a fresh nonce. Each response is cryptographically verified. If the license is revoked or the session expires, the failure handler triggers.
+**SERVER** — The SDK calls `/auth/heartbeat` every `heartbeat_interval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state.
 
-**LOCAL** — No network requests during heartbeats. The SDK verifies the stored HMAC signature and checks that the session hasn't expired. When the prepaid block runs out, it makes a single network call to refresh. Use this for apps where you want minimal network overhead.
+**LOCAL** — No network calls. The SDK re-verifies stored signature state and checks expiry timestamp locally. If expired, it triggers failure with `session_expired`.
 
 ## Failure Handling
 
 If authentication fails (login rejected, heartbeat fails, signature mismatch, etc.), the SDK calls your `on_failure` callback if one is provided. If no callback is set, **the SDK calls `os._exit(1)` to terminate the process.** This is intentional — it prevents your app from running without a valid license.
+
+Recognized server errors:
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`, `checksum_required`, `checksum_mismatch`
+
+Request retries are automatic inside the internal HTTP layer:
+- `rate_limited`: retry after 2s, then 5s (max 3 attempts total)
+- network failure: retry once after 2s
+- every retry regenerates a fresh nonce
 
 ```python
 def handle_auth_failure(reason, exception):
