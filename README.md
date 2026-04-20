@@ -1,8 +1,8 @@
 # AuthForge Python SDK
 
-Official Python SDK for [AuthForge](https://authforge.cc) — credit-based license key authentication with HMAC-verified heartbeats.
+Official Python SDK for [AuthForge](https://authforge.cc) — credit-based license key authentication with Ed25519-verified responses.
 
-**Zero dependencies.** Standard library only. Works on Python 3.9+.
+Uses `cryptography` for Ed25519 verification. Works on Python 3.9+.
 
 ## Quick Start
 
@@ -14,6 +14,7 @@ from authforge import AuthForgeClient
 client = AuthForgeClient(
     app_id="YOUR_APP_ID",           # from your AuthForge dashboard
     app_secret="YOUR_APP_SECRET",   # from your AuthForge dashboard
+    public_key="YOUR_PUBLIC_KEY",   # from your AuthForge dashboard
     heartbeat_mode="SERVER",        # "SERVER" or "LOCAL"
 )
 
@@ -33,6 +34,7 @@ else:
 |---|---|---|---|
 | `app_id` | str | required | Your application ID from the AuthForge dashboard |
 | `app_secret` | str | required | Your application secret from the AuthForge dashboard |
+| `public_key` | str | required | App Ed25519 public key (base64) from dashboard |
 | `heartbeat_mode` | str | required | `"SERVER"` or `"LOCAL"` (see below) |
 | `heartbeat_interval` | int | `900` | Seconds between heartbeat checks (default 15 min) |
 | `api_base_url` | str | `https://auth.authforge.cc` | API endpoint |
@@ -61,7 +63,7 @@ else:
 If authentication fails (login rejected, heartbeat fails, signature mismatch, etc.), the SDK calls your `on_failure` callback if one is provided. If no callback is set, **the SDK calls `os._exit(1)` to terminate the process.** This is intentional — it prevents your app from running without a valid license.
 
 Recognized server errors:
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`, `checksum_required`, `checksum_mismatch`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `bad_request`
 
 Request retries are automatic inside the internal HTTP layer:
 - `rate_limited`: retry after 2s, then 5s (max 3 attempts total)
@@ -79,6 +81,7 @@ def handle_auth_failure(reason, exception):
 client = AuthForgeClient(
     app_id="YOUR_APP_ID",
     app_secret="YOUR_APP_SECRET",
+    public_key="YOUR_PUBLIC_KEY",
     heartbeat_mode="SERVER",
     on_failure=handle_auth_failure,
 )
@@ -86,11 +89,11 @@ client = AuthForgeClient(
 
 ## How It Works
 
-1. **Login** — Collects a hardware fingerprint (MAC, CPU, disk serial), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the HMAC-SHA256 signature and nonce to prevent replay attacks.
+1. **Login** — Collects a hardware fingerprint (MAC, CPU, disk serial), generates a random nonce, and sends everything to the AuthForge API. The server validates the license key, binds the HWID, deducts a credit, and returns a signed payload. The SDK verifies the Ed25519 signature and nonce to prevent replay attacks.
 
 2. **Heartbeat** — A background daemon thread checks in at the configured interval. In SERVER mode, it sends a fresh nonce and verifies the response. In LOCAL mode, it re-verifies the stored signature and checks expiry without network calls.
 
-3. **Crypto** — The `/validate` response is signed with a key derived from `SHA256(appSecret + nonce)`. That response carries a per-session `sigKey` (32-byte random hex) embedded in the signed session token. Every `/heartbeat` response is then signed with a key derived from `SHA256(sigKey + nonce)`. This keeps `appSecret` out of the heartbeat path while still rotating the signing key on every nonce, making replay and MITM attacks impractical.
+3. **Crypto** — Both `/validate` and `/heartbeat` responses are signed by AuthForge with your app's Ed25519 private key. The SDK verifies every signed `payload` using your configured `public_key` and rejects tampered responses.
 
 ## Hardware ID
 
@@ -103,12 +106,12 @@ Each component falls back gracefully if it can't be read (e.g. permissions issue
 
 ## Test Vectors
 
-The `generate_vectors.py` script and `test_vectors.json` file are provided for cross-SDK verification. If you're porting this SDK to another language, your implementation must produce identical `derivedKeyHex` and `signatureHex` values for the same inputs.
+The shared `test_vectors.json` file validates cross-language Ed25519 verification behavior.
 
 ## Requirements
 
 - Python 3.9+
-- No external packages
+- Dependency: `cryptography`
 
 ## License
 

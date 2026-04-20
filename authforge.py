@@ -1,6 +1,5 @@
 import base64
 import hashlib
-import hmac
 import json
 import os
 import platform
@@ -13,6 +12,8 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Optional
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 
 DEFAULT_API_BASE_URL = "https://auth.authforge.cc"
@@ -25,6 +26,7 @@ KNOWN_SERVER_ERRORS = {
     "revoked",
     "hwid_mismatch",
     "no_credits",
+    "app_burn_cap_reached",
     "blocked",
     "rate_limited",
     "replay_detected",
@@ -32,8 +34,6 @@ KNOWN_SERVER_ERRORS = {
     "session_expired",
     "bad_request",
     "server_error",
-    "checksum_required",
-    "checksum_mismatch",
 }
 
 
@@ -42,6 +42,7 @@ class AuthForgeClient:
         self,
         app_id: str,
         app_secret: str,
+        public_key: str,
         heartbeat_mode: str,
         heartbeat_interval: int = 900,
         api_base_url: str = DEFAULT_API_BASE_URL,
@@ -52,6 +53,8 @@ class AuthForgeClient:
             raise ValueError("app_id must be a non-empty string")
         if not app_secret or not isinstance(app_secret, str):
             raise ValueError("app_secret must be a non-empty string")
+        if not public_key or not isinstance(public_key, str):
+            raise ValueError("public_key must be a non-empty base64 string")
         mode = (heartbeat_mode or "").upper()
         if mode not in {"LOCAL", "SERVER"}:
             raise ValueError("heartbeat_mode must be LOCAL or SERVER")
@@ -60,6 +63,7 @@ class AuthForgeClient:
 
         self.app_id = app_id
         self.app_secret = app_secret
+        self.public_key = public_key
         self.heartbeat_mode = mode
         self.heartbeat_interval = int(heartbeat_interval)
         self.api_base_url = api_base_url.rstrip("/")
@@ -77,13 +81,13 @@ class AuthForgeClient:
         self._last_nonce: Optional[str] = None
         self._raw_payload_b64: Optional[str] = None
         self._signature: Optional[str] = None
-        self._derived_key: Optional[bytes] = None
-        self._sig_key: Optional[str] = None
+        self._key_id: Optional[str] = None
         self._session_data: Optional[Dict[str, Any]] = None
         self._app_variables: Optional[Dict[str, Any]] = None
         self._license_variables: Optional[Dict[str, Any]] = None
         self._authenticated = False
         self._hwid = self._get_hwid()
+        self._ed25519_public_key = self._load_public_key(public_key)
 
     def login(self, license_key: str) -> bool:
         if not license_key or not isinstance(license_key, str):
@@ -147,12 +151,11 @@ class AuthForgeClient:
         with self._lock:
             raw_payload_b64 = self._raw_payload_b64
             signature = self._signature
-            derived_key = self._derived_key
             expires_in = self._session_expires_in
-        if not raw_payload_b64 or not signature or not derived_key:
+        if not raw_payload_b64 or not signature:
             raise RuntimeError("missing_local_verification_state")
 
-        self._verify_signature(raw_payload_b64, derived_key, signature)
+        self._verify_signature(raw_payload_b64, signature)
 
         if expires_in is None:
             raise RuntimeError("missing_session_expiry")
@@ -198,21 +201,14 @@ class AuthForgeClient:
         if received_nonce != expected_nonce:
             raise ValueError("nonce_mismatch")
 
-        if context == "validate":
-            derived_key = self._derive_validate_key(expected_nonce)
-        elif context == "heartbeat":
-            derived_key = self._derive_heartbeat_key(expected_nonce)
-        else:
-            raise ValueError(f"unknown_signing_context:{context}")
-        self._verify_signature(raw_payload_b64, derived_key, signature)
+        self._verify_signature(raw_payload_b64, signature)
 
         session_token = str(payload_json.get("sessionToken", "")).strip()
         if not session_token:
             raise ValueError("missing_sessionToken")
-
-        new_sig_key = self._extract_sig_key_from_session_token(session_token)
-        if not new_sig_key:
-            raise ValueError("missing_sigKey")
+        key_id = response_obj.get("keyId")
+        if key_id is not None and not isinstance(key_id, str):
+            raise ValueError("invalid_keyId")
 
         expires_from_token = self._extract_expires_in_from_session_token(session_token)
         expires_from_payload = payload_json.get("expiresIn")
@@ -231,8 +227,7 @@ class AuthForgeClient:
             self._last_nonce = expected_nonce
             self._raw_payload_b64 = raw_payload_b64
             self._signature = signature
-            self._derived_key = derived_key
-            self._sig_key = new_sig_key
+            self._key_id = key_id
             self._session_data = dict(payload_json)
             self._app_variables = self._extract_optional_map(payload_json.get("appVariables"))
             self._license_variables = self._extract_optional_map(payload_json.get("licenseVariables"))
@@ -369,19 +364,10 @@ class AuthForgeClient:
         payload = self._decode_session_token_body(session_token)
         if payload is None:
             return None
-        value = payload.get("expiresIn")
+        value = payload.get("exp")
         if value is None:
             return None
         return int(value)
-
-    def _extract_sig_key_from_session_token(self, session_token: str) -> Optional[str]:
-        payload = self._decode_session_token_body(session_token)
-        if payload is None:
-            return None
-        value = payload.get("sigKey")
-        if not isinstance(value, str) or not value:
-            return None
-        return value
 
     def _decode_session_token_body(self, session_token: str) -> Optional[Dict[str, Any]]:
         parts = session_token.split(".")
@@ -403,26 +389,31 @@ class AuthForgeClient:
             return text
         return text + ("=" * (4 - remainder))
 
-    def _derive_validate_key(self, nonce: str) -> bytes:
-        seed = f"{self.app_secret}{nonce}".encode("utf-8")
-        return hashlib.sha256(seed).digest()
+    def _load_public_key(self, public_key_b64: str) -> Ed25519PublicKey:
+        try:
+            public_key_bytes = base64.b64decode(
+                self._add_base64_padding(public_key_b64), validate=True
+            )
+        except Exception as exc:
+            raise ValueError("invalid_public_key") from exc
+        if len(public_key_bytes) != 32:
+            raise ValueError("invalid_public_key_length")
+        return Ed25519PublicKey.from_public_bytes(public_key_bytes)
 
-    def _derive_heartbeat_key(self, nonce: str) -> bytes:
-        sig_key = self._sig_key
-        if not sig_key:
-            raise RuntimeError("missing_sig_key")
-        seed = f"{sig_key}{nonce}".encode("utf-8")
-        return hashlib.sha256(seed).digest()
-
-    def _verify_signature(self, raw_payload_b64: str, derived_key: bytes, signature: str) -> None:
-        expected = hmac.new(
-            derived_key,
-            raw_payload_b64.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        received = signature.strip().lower()
-        if not hmac.compare_digest(expected, received):
-            raise ValueError("signature_mismatch")
+    def _verify_signature(self, raw_payload_b64: str, signature: str) -> None:
+        try:
+            signature_bytes = base64.b64decode(
+                self._add_base64_padding(signature), validate=True
+            )
+        except Exception as exc:
+            raise ValueError("invalid_signature_encoding") from exc
+        try:
+            self._ed25519_public_key.verify(
+                signature_bytes,
+                raw_payload_b64.encode("utf-8"),
+            )
+        except InvalidSignature as exc:
+            raise ValueError("signature_mismatch") from exc
 
     def _generate_nonce(self) -> str:
         return secrets.token_hex(16)
@@ -476,8 +467,7 @@ class AuthForgeClient:
             self._last_nonce = None
             self._raw_payload_b64 = None
             self._signature = None
-            self._derived_key = None
-            self._sig_key = None
+            self._key_id = None
             self._session_data = None
             self._app_variables = None
             self._license_variables = None
