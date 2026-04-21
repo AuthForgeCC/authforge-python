@@ -6,7 +6,13 @@ Uses `cryptography` for Ed25519 verification. Works on Python 3.9+.
 
 ## Quick Start
 
-Copy `authforge.py` into your project, then:
+Install from PyPI:
+
+```bash
+pip install authforge
+```
+
+Or copy `authforge.py` into your project directly, then:
 
 ```python
 from authforge import AuthForgeClient

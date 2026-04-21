@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authforge"
+version = "1.0.0"
+description = "Official Python SDK for AuthForge — credit-based license key authentication with Ed25519-verified responses."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "AuthForge" }]
+keywords = ["authforge", "license", "licensing", "hwid", "authentication"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = ["cryptography>=41.0.0"]
+
+[project.urls]
+Homepage = "https://authforge.cc"
+Documentation = "https://docs.authforge.cc"
+Source = "https://github.com/AuthForgeCC/authforge-python"
+Issues = "https://github.com/AuthForgeCC/authforge-python/issues"
+
+[tool.setuptools]
+py-modules = ["authforge"]
