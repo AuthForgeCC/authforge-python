@@ -7,6 +7,12 @@
 
 AuthForge is a license key validation service. Your app sends a license key + hardware ID to the AuthForge API, gets back a cryptographically signed response, and runs background heartbeats to maintain the session. If the license is revoked or expired, the heartbeat fails and you handle it (typically exit the app).
 
+## Billing model (so you can pick sensible intervals)
+
+- **1 `login()` = 1 credit** (one `/auth/validate` debit).
+- **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
+- Any `heartbeat_interval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations always take effect on the **next** heartbeat regardless of interval.
+
 ## Installation
 
 Copy `authforge.py` into your project (single file, stdlib only). Requires Python 3.9+.
@@ -55,10 +61,11 @@ if __name__ == "__main__":
 | `app_id` | `str` | yes | — | Application ID |
 | `app_secret` | `str` | yes | — | Application secret |
 | `heartbeat_mode` | `str` | yes | — | `"SERVER"` or `"LOCAL"` (case-insensitive) |
-| `heartbeat_interval` | `int` | no | `900` | Seconds between heartbeats |
+| `heartbeat_interval` | `int` | no | `900` | Seconds between heartbeats (any value ≥ 1) |
 | `api_base_url` | `str` | no | `https://auth.authforge.cc` | API base URL |
 | `on_failure` | `Callable[[str, Optional[Exception]], None] \| None` | no | `None` | Called on login/heartbeat/network failure; if omitted, process exits via `os._exit(1)` |
 | `request_timeout` | `int` | no | `15` | HTTP timeout (seconds) |
+| `ttl_seconds` | `int \| None` | no | `None` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
 
 ## Methods
 
@@ -74,6 +81,9 @@ if __name__ == "__main__":
 ## Error codes the server can return
 
 invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, blocked, rate_limited, replay_detected, session_expired, app_disabled, bad_request
+
+Notes:
+- `rate_limited` and `replay_detected` can only be returned from `/auth/validate`. Heartbeats are not IP rate-limited and do not enforce nonce replay.
 
 ## Common patterns
 
