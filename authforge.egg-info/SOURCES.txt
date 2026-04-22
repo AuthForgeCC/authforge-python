@@ -1,9 +1,0 @@
-LICENSE
-README.md
-authforge.py
-pyproject.toml
-authforge.egg-info/PKG-INFO
-authforge.egg-info/SOURCES.txt
-authforge.egg-info/dependency_links.txt
-authforge.egg-info/requires.txt
-authforge.egg-info/top_level.txt

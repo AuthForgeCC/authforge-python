@@ -1,2 +1,38 @@
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments (local / CI helpers)
+.venv/
+venv/
+.venv-*/
+ENV/
+
+# Local secrets
+.env
+.env.*
+
+# Packaging / setuptools
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+.cache/
+coverage.xml
+*.cover
+.hypothesis/
+
+# OS / editor
+.DS_Store
+Thumbs.db
