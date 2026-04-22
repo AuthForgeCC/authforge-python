@@ -6,7 +6,7 @@ Uses `cryptography` for Ed25519 verification. Works on Python 3.9+.
 
 ## Installation
 
-The distribution on [PyPI](https://pypi.org/project/authforge-sdk/) is **`authforge-sdk`** (same idea as scoped npm names: install name ≠ import path). After installing, import the **`authforge`** module:
+Install from [PyPI](https://pypi.org/project/authforge-sdk/) as **`authforge-sdk`**. In code, import the **`authforge`** module:
 
 ```bash
 pip install authforge-sdk
