@@ -21,10 +21,13 @@ jobs:
           pip install build twine
       - name: Verify tag matches pyproject version
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/v}"
-          PYPROJECT=$(grep '^version' pyproject.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          if [ "$TAG" != "$PYPROJECT" ]; then
-            echo "Tag v$TAG does not match pyproject.toml version $PYPROJECT"
+          TAG="${TAG//$'\r'/}"
+          # Read [project].version with tomllib (stdlib on 3.11+). Avoids CRLF / grep picking the wrong line.
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "Tag v$TAG does not match pyproject.toml [project] version $VERSION"
             exit 1
           fi
       - name: Build
