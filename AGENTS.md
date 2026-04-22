@@ -15,7 +15,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Installation
 
-Copy `authforge.py` into your project (single file, stdlib only). Requires Python 3.9+.
+Prefer **`pip install authforge-sdk`** from [PyPI](https://pypi.org/project/authforge-sdk/) (installs the `cryptography` dependency). Imports remain **`from authforge import …`**. For a vendored single-file layout, copy `authforge.py` and add `cryptography` to your environment. Requires Python 3.9+.
 
 ## Minimal working integration
 

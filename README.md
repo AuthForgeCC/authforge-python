@@ -4,15 +4,19 @@ Official Python SDK for [AuthForge](https://authforge.cc) — credit-based licen
 
 Uses `cryptography` for Ed25519 verification. Works on Python 3.9+.
 
-## Quick Start
+## Installation
 
-Install from PyPI:
+The distribution on [PyPI](https://pypi.org/project/authforge-sdk/) is **`authforge-sdk`** (same idea as scoped npm names: install name ≠ import path). After installing, import the **`authforge`** module:
 
 ```bash
-pip install authforge
+pip install authforge-sdk
 ```
 
-Or copy `authforge.py` into your project directly, then:
+**Alternative:** copy `authforge.py` into your project if you need a single-file vendored layout (you must still satisfy the `cryptography` dependency yourself).
+
+## Quick Start
+
+After **`pip install authforge-sdk`** (or vendoring `authforge.py`), use:
 
 ```python
 from authforge import AuthForgeClient
