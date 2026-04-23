@@ -66,6 +66,9 @@ if __name__ == "__main__":
 | `on_failure` | `Callable[[str, Optional[Exception]], None] \| None` | no | `None` | Called on login/heartbeat/network failure; if omitted, process exits via `os._exit(1)` |
 | `request_timeout` | `int` | no | `15` | HTTP timeout (seconds) |
 | `ttl_seconds` | `int \| None` | no | `None` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
+| `hwid_override` | `str \| None` | no | `None` | Optional custom HWID/subject string. When set to a non-empty value (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
+
+For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<user_id>`) instead of usernames.
 
 ## Methods
 

@@ -32,6 +32,7 @@ KNOWN_SERVER_ERRORS = {
     "replay_detected",
     "app_disabled",
     "session_expired",
+    "revoke_requires_session",
     "bad_request",
     "system_error",
 }
@@ -49,6 +50,7 @@ class AuthForgeClient:
         on_failure: Optional[Callable[[str, Optional[Exception]], None]] = None,
         request_timeout: int = 15,
         ttl_seconds: Optional[int] = None,
+        hwid_override: Optional[str] = None,
     ) -> None:
         if not app_id or not isinstance(app_id, str):
             raise ValueError("app_id must be a non-empty string")
@@ -92,7 +94,7 @@ class AuthForgeClient:
         self._app_variables: Optional[Dict[str, Any]] = None
         self._license_variables: Optional[Dict[str, Any]] = None
         self._authenticated = False
-        self._hwid = self._get_hwid()
+        self._hwid = self._resolve_hwid(hwid_override)
         self._ed25519_public_key = self._load_public_key(public_key)
 
     def login(self, license_key: str) -> bool:
@@ -106,6 +108,65 @@ class AuthForgeClient:
         except Exception as exc:
             self._fail("login_failed", exc)
             return False
+
+    def self_ban(
+        self,
+        *,
+        license_key: Optional[str] = None,
+        session_token: Optional[str] = None,
+        revoke_license: bool = True,
+        blacklist_hwid: bool = True,
+        blacklist_ip: bool = True,
+    ) -> Dict[str, Any]:
+        resolved_session = (
+            session_token.strip()
+            if isinstance(session_token, str) and session_token.strip()
+            else None
+        )
+        with self._lock:
+            current_session = self._session_token
+            current_license = self._license_key
+            hwid = self._hwid
+        resolved_session = resolved_session or current_session
+
+        if resolved_session:
+            body: Dict[str, Any] = {
+                "appId": self.app_id,
+                "sessionToken": resolved_session,
+                "hwid": hwid,
+                "revokeLicense": bool(revoke_license),
+                "blacklistHwid": bool(blacklist_hwid),
+                "blacklistIp": bool(blacklist_ip),
+            }
+            response_obj = self._post_json("/auth/selfban", body)
+            if not self._is_success_status(response_obj.get("status")):
+                raise ValueError(self._extract_server_error(response_obj))
+            return response_obj
+
+        resolved_license = (
+            license_key.strip()
+            if isinstance(license_key, str) and license_key.strip()
+            else None
+        )
+        resolved_license = resolved_license or current_license
+        if not resolved_license:
+            raise ValueError("missing_license_key")
+
+        body = {
+            "appId": self.app_id,
+            "appSecret": self.app_secret,
+            "licenseKey": resolved_license,
+            "hwid": hwid,
+            "nonce": self._generate_nonce(),
+            # Pre-session self-ban cannot revoke licenses.
+            "revokeLicense": False,
+            "blacklistHwid": bool(blacklist_hwid),
+            "blacklistIp": bool(blacklist_ip),
+        }
+        response_obj = self._post_json("/auth/selfban", body)
+        if not self._is_success_status(response_obj.get("status")):
+            raise ValueError(self._extract_server_error(response_obj))
+        return response_obj
 
     def _start_heartbeat_once(self) -> None:
         with self._lock:
@@ -309,6 +370,13 @@ class AuthForgeClient:
         disk = self._safe_disk_serial()
         material = f"mac:{mac}|cpu:{cpu}|disk:{disk}"
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _resolve_hwid(self, hwid_override: Optional[str]) -> str:
+        if isinstance(hwid_override, str):
+            trimmed = hwid_override.strip()
+            if trimmed:
+                return trimmed
+        return self._get_hwid()
 
     def _safe_mac_address(self) -> str:
         try:
