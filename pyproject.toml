@@ -1,11 +1,11 @@
-﻿[build-system]
+[build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "authforge-sdk"
 version = "1.0.2"
-description = "Official Python SDK for AuthForge â€” credit-based license key authentication with Ed25519-verified responses."
+description = "Official Python SDK for AuthForge — credit-based license key authentication with Ed25519-verified responses."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
