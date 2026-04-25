@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Literal, Optional, TypedDict, Union
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -19,6 +19,25 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 DEFAULT_API_BASE_URL = "https://auth.authforge.cc"
 RATE_LIMIT_RETRY_DELAYS = (2, 5)
 NETWORK_RETRY_DELAY = 2
+class ValidateLicenseSuccess(TypedDict):
+    valid: Literal[True]
+    session_token: str
+    expires_in: int
+    session_data: Dict[str, Any]
+    app_variables: Optional[Dict[str, Any]]
+    license_variables: Optional[Dict[str, Any]]
+    key_id: Optional[str]
+
+
+class ValidateLicenseFailure(TypedDict):
+    valid: Literal[False]
+    code: str
+    error: str
+
+
+ValidateLicenseResult = Union[ValidateLicenseSuccess, ValidateLicenseFailure]
+
+
 KNOWN_SERVER_ERRORS = {
     "invalid_app",
     "invalid_key",
@@ -108,6 +127,36 @@ class AuthForgeClient:
         except Exception as exc:
             self._fail("login_failed", exc)
             return False
+
+    def validate_license(self, license_key: str) -> ValidateLicenseResult:
+        """Validate like :meth:`login` (same /auth/validate + signatures) without storing
+        session state or starting the heartbeat thread."""
+        if not license_key or not isinstance(license_key, str):
+            raise ValueError("license_key must be a non-empty string")
+        try:
+            body: Dict[str, Any] = {
+                "appId": self.app_id,
+                "appSecret": self.app_secret,
+                "licenseKey": license_key,
+                "hwid": self._hwid,
+                "nonce": self._generate_nonce(),
+            }
+            if self.ttl_seconds is not None:
+                body["ttlSeconds"] = self.ttl_seconds
+            response_obj = self._post_json("/auth/validate", body, skip_failure_hook=True)
+            expected_nonce = str(body.get("nonce", "")).strip()
+            parsed = self._parse_validate_success(response_obj, expected_nonce)
+            return {
+                "valid": True,
+                "session_token": parsed["session_token"],
+                "expires_in": parsed["expires_in"],
+                "session_data": parsed["session_data"],
+                "app_variables": parsed["app_variables"],
+                "license_variables": parsed["license_variables"],
+                "key_id": parsed["key_id"],
+            }
+        except Exception as exc:
+            return {"valid": False, "code": str(exc), "error": str(exc)}
 
     def self_ban(
         self,
@@ -250,13 +299,9 @@ class AuthForgeClient:
             context="validate",
         )
 
-    def _apply_signed_response(
-        self,
-        response_obj: Dict[str, Any],
-        expected_nonce: str,
-        license_key: Optional[str],
-        context: str,
-    ) -> None:
+    def _parse_validate_success(
+        self, response_obj: Dict[str, Any], expected_nonce: str
+    ) -> Dict[str, Any]:
         status = response_obj.get("status")
         if not self._is_success_status(status):
             error_code = self._extract_server_error(response_obj)
@@ -288,21 +333,46 @@ class AuthForgeClient:
         if expires_in is None:
             raise ValueError("missing_expiresIn")
 
+        return {
+            "session_token": session_token,
+            "expires_in": int(expires_in),
+            "session_data": dict(payload_json),
+            "app_variables": self._extract_optional_map(payload_json.get("appVariables")),
+            "license_variables": self._extract_optional_map(
+                payload_json.get("licenseVariables")
+            ),
+            "key_id": key_id if isinstance(key_id, str) else None,
+            "raw_payload_b64": raw_payload_b64,
+            "signature": signature,
+        }
+
+    def _apply_signed_response(
+        self,
+        response_obj: Dict[str, Any],
+        expected_nonce: str,
+        license_key: Optional[str],
+        context: str,
+    ) -> None:
+        parsed = self._parse_validate_success(response_obj, expected_nonce)
+        _ = context
+
         with self._lock:
             if license_key is not None:
                 self._license_key = license_key
-            self._session_token = session_token
-            self._session_expires_in = int(expires_in)
+            self._session_token = parsed["session_token"]
+            self._session_expires_in = int(parsed["expires_in"])
             self._last_nonce = expected_nonce
-            self._raw_payload_b64 = raw_payload_b64
-            self._signature = signature
-            self._key_id = key_id
-            self._session_data = dict(payload_json)
-            self._app_variables = self._extract_optional_map(payload_json.get("appVariables"))
-            self._license_variables = self._extract_optional_map(payload_json.get("licenseVariables"))
+            self._raw_payload_b64 = parsed["raw_payload_b64"]
+            self._signature = parsed["signature"]
+            self._key_id = parsed["key_id"]
+            self._session_data = dict(parsed["session_data"])
+            self._app_variables = parsed["app_variables"]
+            self._license_variables = parsed["license_variables"]
             self._authenticated = True
 
-    def _post_json(self, path: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _post_json(
+        self, path: str, data: Dict[str, Any], *, skip_failure_hook: bool = False
+    ) -> Dict[str, Any]:
         url = f"{self.api_base_url}{path}"
         body = dict(data)
         rate_attempt = 0
@@ -342,7 +412,8 @@ class AuthForgeClient:
                         network_attempt += 1
                         time.sleep(NETWORK_RETRY_DELAY)
                         continue
-                    self._fail("network_error", exc)
+                    if not skip_failure_hook:
+                        self._fail("network_error", exc)
                     raise RuntimeError(f"url_error: {exc}") from exc
 
             is_rate_limited = (

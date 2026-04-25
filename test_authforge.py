@@ -51,6 +51,76 @@ class Ed25519VectorTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.args[0], "signature_mismatch")
 
 
+class ValidateLicenseTests(unittest.TestCase):
+    def test_validate_license_success_no_heartbeat(self) -> None:
+        vectors = _load_test_vectors()
+        success_case = next(
+            case for case in vectors["cases"] if case["id"] == "validate_success"
+        )
+        nonce = "nonce-validate-001"
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(
+            {
+                "status": "ok",
+                "payload": success_case["payload"],
+                "signature": success_case["signature"],
+                "keyId": "signing-key-1",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        urlopen_cm = MagicMock()
+        urlopen_cm.__enter__.return_value = mock_resp
+        urlopen_cm.__exit__.return_value = None
+
+        with (
+            patch("authforge.urllib.request.urlopen", return_value=urlopen_cm),
+            patch.object(AuthForgeClient, "_generate_nonce", return_value=nonce),
+        ):
+            client = AuthForgeClient(
+                "app-id",
+                "app-secret",
+                vectors["publicKey"],
+                "LOCAL",
+                heartbeat_interval=86400,
+            )
+            result = client.validate_license("license-key")
+
+        self.assertTrue(result["valid"])
+        self.assertFalse(client._heartbeat_started)
+        self.assertFalse(client.is_authenticated())
+        self.assertEqual(result["session_token"], "session.validate.token")
+        self.assertEqual(result["app_variables"], {"tier": "pro"})
+
+    def test_validate_license_failure_no_heartbeat(self) -> None:
+        vectors = _load_test_vectors()
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps(
+            {"status": "invalid_key", "error": "invalid_key"},
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        urlopen_cm = MagicMock()
+        urlopen_cm.__enter__.return_value = mock_resp
+        urlopen_cm.__exit__.return_value = None
+
+        with patch("authforge.urllib.request.urlopen", return_value=urlopen_cm):
+            client = AuthForgeClient(
+                "app-id",
+                "app-secret",
+                vectors["publicKey"],
+                "LOCAL",
+                heartbeat_interval=86400,
+            )
+            result = client.validate_license("bad")
+
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["code"], "invalid_key")
+        self.assertFalse(client._heartbeat_started)
+
+
 class LoginFlowTests(unittest.TestCase):
     def test_login_parses_and_stores_signed_payload(self) -> None:
         vectors = _load_test_vectors()

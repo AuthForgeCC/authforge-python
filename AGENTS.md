@@ -9,7 +9,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 ## Billing model (so you can pick sensible intervals)
 
-- **1 `login()` = 1 credit** (one `/auth/validate` debit).
+- **1 `login()` or `validate_license()` = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
 - Any `heartbeat_interval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations always take effect on the **next** heartbeat regardless of interval.
 
@@ -63,7 +63,7 @@ if __name__ == "__main__":
 | `heartbeat_mode` | `str` | yes | — | `"SERVER"` or `"LOCAL"` (case-insensitive) |
 | `heartbeat_interval` | `int` | no | `900` | Seconds between heartbeats (any value ≥ 1) |
 | `api_base_url` | `str` | no | `https://auth.authforge.cc` | API base URL |
-| `on_failure` | `Callable[[str, Optional[Exception]], None] \| None` | no | `None` | Called on login/heartbeat/network failure; if omitted, process exits via `os._exit(1)` |
+| `on_failure` | `Callable[[str, Optional[Exception]], None] \| None` | no | `None` | Called on login/heartbeat/network failure; if omitted, process exits via `os._exit(1)` (not used by `validate_license`) |
 | `request_timeout` | `int` | no | `15` | HTTP timeout (seconds) |
 | `ttl_seconds` | `int \| None` | no | `None` (server default: 86400) | Requested session token lifetime. Server clamps to `[3600, 604800]`; preserved across heartbeat refreshes. |
 | `hwid_override` | `str \| None` | no | `None` | Optional custom HWID/subject string. When set to a non-empty value (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
@@ -75,6 +75,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `login(license_key: str)` | `bool` | Validates license, verifies signatures, starts heartbeat thread |
+| `validate_license(license_key: str)` | `ValidateLicenseResult` | Same validate + signatures as login; no session persistence or heartbeat; **never** calls `on_failure` or `os._exit` |
 | `logout()` | `None` | Stops heartbeat and clears session state |
 | `is_authenticated()` | `bool` | Whether a session token is present and marked authenticated |
 | `get_session_data()` | `dict \| None` | Decoded signed payload map |

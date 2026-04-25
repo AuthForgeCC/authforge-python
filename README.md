@@ -67,7 +67,7 @@ client = AuthForgeClient(
 
 ## Billing
 
-- **1 `login()` call = 1 credit** (one `/auth/validate` debit).
+- **1 `login()` or `validate_license()` call = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats on the same license = 1 credit** (billed every 10th successful heartbeat).
 
 A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A server app running 24/7 at a 1-minute interval burns ~145 credits/day — pick the interval based on how fast you need revocations to propagate (they always land on the **next** heartbeat).
@@ -77,6 +77,7 @@ A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A
 | Method | Returns | Description |
 |---|---|---|
 | `login(license_key)` | `bool` | Validates key and stores signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
+| `validate_license(license_key)` | `ValidateLicenseResult` | Same `/auth/validate` + signatures as `login`; does not store session or start heartbeats; returns a dict with `valid` / `code` and **never** calls `on_failure` or `os._exit` |
 | `self_ban(...)` | `dict` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
 | `logout()` | `None` | Stops heartbeat and clears all session/auth state |
 | `is_authenticated()` | `bool` | True when an active authenticated session exists |
@@ -93,6 +94,8 @@ A desktop app running 6h/day at a 15-minute interval burns ~3–4 credits/day. A
 ## Failure Handling
 
 If authentication fails (login rejected, heartbeat fails, signature mismatch, etc.), the SDK calls your `on_failure` callback if one is provided. If no callback is set, **the SDK calls `os._exit(1)` to terminate the process.** This is intentional — it prevents your app from running without a valid license.
+
+**`validate_license()`** does not trigger `on_failure` or `os._exit` — check `result["valid"]` and `result["code"]`.
 
 Recognized server errors:
 `invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`
