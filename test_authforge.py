@@ -51,6 +51,52 @@ class Ed25519VectorTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.args[0], "signature_mismatch")
 
 
+class MultiKeyRotationTests(unittest.TestCase):
+    """The SDK must verify against any public key in the configured trust
+    list, so a deployment can rotate the server-side key while clients are
+    still pinned to the old one."""
+
+    DECOY_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+    def test_list_form_accepts_real_key(self) -> None:
+        vectors = _load_test_vectors()
+        case = next(c for c in vectors["cases"] if c["id"] == "validate_success")
+        client = AuthForgeClient(
+            "app",
+            "secret",
+            [self.DECOY_KEY, vectors["publicKey"]],
+            "LOCAL",
+            heartbeat_interval=86400,
+        )
+        # Bogus key is first; verification must walk to the second entry.
+        client._verify_signature(case["payload"], case["signature"])
+        self.assertEqual(client.public_keys[0], self.DECOY_KEY)
+        self.assertEqual(client.public_keys[1], vectors["publicKey"])
+
+    def test_comma_separated_form_accepts_real_key(self) -> None:
+        vectors = _load_test_vectors()
+        case = next(c for c in vectors["cases"] if c["id"] == "validate_success")
+        combined = f"{self.DECOY_KEY},{vectors['publicKey']}"
+        client = AuthForgeClient(
+            "app", "secret", combined, "LOCAL", heartbeat_interval=86400
+        )
+        client._verify_signature(case["payload"], case["signature"])
+
+    def test_all_unknown_keys_still_fails(self) -> None:
+        vectors = _load_test_vectors()
+        case = next(c for c in vectors["cases"] if c["id"] == "validate_success")
+        client = AuthForgeClient(
+            "app",
+            "secret",
+            [self.DECOY_KEY],
+            "LOCAL",
+            heartbeat_interval=86400,
+        )
+        with self.assertRaises(ValueError) as ctx:
+            client._verify_signature(case["payload"], case["signature"])
+        self.assertEqual(ctx.exception.args[0], "signature_mismatch")
+
+
 class ValidateLicenseTests(unittest.TestCase):
     def test_validate_license_success_no_heartbeat(self) -> None:
         vectors = _load_test_vectors()

@@ -11,9 +11,12 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Callable, Dict, Literal, Optional, TypedDict, Union
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, TypedDict, Union
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+
+PublicKeyArg = Union[str, Sequence[str]]
 
 
 DEFAULT_API_BASE_URL = "https://auth.authforge.cc"
@@ -62,7 +65,7 @@ class AuthForgeClient:
         self,
         app_id: str,
         app_secret: str,
-        public_key: str,
+        public_key: PublicKeyArg,
         heartbeat_mode: str,
         heartbeat_interval: int = 900,
         api_base_url: str = DEFAULT_API_BASE_URL,
@@ -75,8 +78,11 @@ class AuthForgeClient:
             raise ValueError("app_id must be a non-empty string")
         if not app_secret or not isinstance(app_secret, str):
             raise ValueError("app_secret must be a non-empty string")
-        if not public_key or not isinstance(public_key, str):
-            raise ValueError("public_key must be a non-empty base64 string")
+        public_key_list = self._normalize_public_key_list(public_key)
+        if not public_key_list:
+            raise ValueError(
+                "public_key must be a non-empty base64 string or list of base64 strings"
+            )
         mode = (heartbeat_mode or "").upper()
         if mode not in {"LOCAL", "SERVER"}:
             raise ValueError("heartbeat_mode must be LOCAL or SERVER")
@@ -85,7 +91,11 @@ class AuthForgeClient:
 
         self.app_id = app_id
         self.app_secret = app_secret
-        self.public_key = public_key
+        # `public_key` is the historical public attribute. We now hold the
+        # full trust list to support key rotation, but expose the first entry
+        # as `public_key` for callers that read it directly.
+        self.public_keys: List[str] = public_key_list
+        self.public_key = public_key_list[0]
         self.heartbeat_mode = mode
         self.heartbeat_interval = int(heartbeat_interval)
         self.api_base_url = api_base_url.rstrip("/")
@@ -114,7 +124,9 @@ class AuthForgeClient:
         self._license_variables: Optional[Dict[str, Any]] = None
         self._authenticated = False
         self._hwid = self._resolve_hwid(hwid_override)
-        self._ed25519_public_key = self._load_public_key(public_key)
+        self._ed25519_public_keys: List[Ed25519PublicKey] = [
+            self._load_public_key(k) for k in public_key_list
+        ]
 
     def login(self, license_key: str) -> bool:
         if not license_key or not isinstance(license_key, str):
@@ -554,13 +566,42 @@ class AuthForgeClient:
             )
         except Exception as exc:
             raise ValueError("invalid_signature_encoding") from exc
-        try:
-            self._ed25519_public_key.verify(
-                signature_bytes,
-                raw_payload_b64.encode("utf-8"),
-            )
-        except InvalidSignature as exc:
-            raise ValueError("signature_mismatch") from exc
+        # During a key rotation the SDK may be pinned to the previous key
+        # while a new server-side key signs responses (or vice-versa). Trust
+        # any key in the configured list.
+        payload_bytes = raw_payload_b64.encode("utf-8")
+        for key in self._ed25519_public_keys:
+            try:
+                key.verify(signature_bytes, payload_bytes)
+                return
+            except InvalidSignature:
+                continue
+        raise ValueError("signature_mismatch")
+
+    @staticmethod
+    def _normalize_public_key_list(value: PublicKeyArg) -> List[str]:
+        """Coerce the public_key constructor arg to a list of base64 strings.
+
+        Accepts:
+          - "abc..."                     single-key historical contract
+          - ["abc...", "def..."]         current first, previous after
+          - "abc...,def..."              env-var convenience form
+        """
+        keys: List[str] = []
+        candidates: Iterable[Any]
+        if isinstance(value, str):
+            candidates = value.split(",") if "," in value else [value]
+        elif isinstance(value, Sequence):
+            candidates = value
+        else:
+            return []
+        for entry in candidates:
+            if not isinstance(entry, str):
+                continue
+            trimmed = entry.strip()
+            if trimmed:
+                keys.append(trimmed)
+        return keys
 
     def _generate_nonce(self) -> str:
         return secrets.token_hex(16)
