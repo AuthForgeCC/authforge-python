@@ -12,6 +12,8 @@ import urllib.error
 import urllib.request
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, TypedDict, Union
+
+from typing_extensions import NotRequired
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -30,6 +32,11 @@ class ValidateLicenseSuccess(TypedDict):
     app_variables: Optional[Dict[str, Any]]
     license_variables: Optional[Dict[str, Any]]
     key_id: Optional[str]
+    session_expires_at: NotRequired[str]
+    license_expires_at: NotRequired[Optional[str]]
+    max_hwid_slots: NotRequired[int]
+    hwid_count: NotRequired[int]
+    license_label: NotRequired[str]
 
 
 class ValidateLicenseFailure(TypedDict):
@@ -158,7 +165,7 @@ class AuthForgeClient:
             response_obj = self._post_json("/auth/validate", body, skip_failure_hook=True)
             expected_nonce = str(body.get("nonce", "")).strip()
             parsed = self._parse_validate_success(response_obj, expected_nonce)
-            return {
+            result: ValidateLicenseSuccess = {
                 "valid": True,
                 "session_token": parsed["session_token"],
                 "expires_in": parsed["expires_in"],
@@ -167,6 +174,17 @@ class AuthForgeClient:
                 "license_variables": parsed["license_variables"],
                 "key_id": parsed["key_id"],
             }
+            if "session_expires_at" in parsed:
+                result["session_expires_at"] = parsed["session_expires_at"]
+            if "license_expires_at" in parsed:
+                result["license_expires_at"] = parsed["license_expires_at"]
+            if "max_hwid_slots" in parsed:
+                result["max_hwid_slots"] = parsed["max_hwid_slots"]
+            if "hwid_count" in parsed:
+                result["hwid_count"] = parsed["hwid_count"]
+            if "license_label" in parsed:
+                result["license_label"] = parsed["license_label"]
+            return result
         except Exception as exc:
             return {"valid": False, "code": str(exc), "error": str(exc)}
 
@@ -345,7 +363,7 @@ class AuthForgeClient:
         if expires_in is None:
             raise ValueError("missing_expiresIn")
 
-        return {
+        out: Dict[str, Any] = {
             "session_token": session_token,
             "expires_in": int(expires_in),
             "session_data": dict(payload_json),
@@ -357,6 +375,26 @@ class AuthForgeClient:
             "raw_payload_b64": raw_payload_b64,
             "signature": signature,
         }
+        se = payload_json.get("sessionExpiresAt")
+        if isinstance(se, str) and se != "":
+            out["session_expires_at"] = se
+        if "licenseExpiresAt" in payload_json:
+            le = payload_json["licenseExpiresAt"]
+            out["license_expires_at"] = le if isinstance(le, str) else None
+        if "maxHwidSlots" in payload_json:
+            try:
+                out["max_hwid_slots"] = int(payload_json["maxHwidSlots"])
+            except (TypeError, ValueError):
+                pass
+        if "hwidCount" in payload_json:
+            try:
+                out["hwid_count"] = int(payload_json["hwidCount"])
+            except (TypeError, ValueError):
+                pass
+        ll = payload_json.get("licenseLabel")
+        if isinstance(ll, str) and ll != "":
+            out["license_label"] = ll
+        return out
 
     def _apply_signed_response(
         self,
