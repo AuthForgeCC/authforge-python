@@ -11,7 +11,7 @@ AuthForge is a license key validation service. Your app sends a license key + ha
 
 - **1 `login()` or `validate_license()` = 1 credit** (one `/auth/validate` debit each).
 - **10 heartbeats = 1 credit** (billed on every 10th successful heartbeat per license).
-- Any `heartbeat_interval` is safe — from `1` (server apps) to `900` (15 min, desktop apps). Revocations always take effect on the **next** heartbeat regardless of interval.
+- Keep `heartbeat_interval` at `>= 10` seconds (`900` / 15 min is the typical desktop default). `/auth/heartbeat` is limited to 6 requests/minute per license key, and revocations still take effect on the **next** heartbeat.
 
 ## Installation
 
@@ -61,7 +61,7 @@ if __name__ == "__main__":
 | `app_id` | `str` | yes | — | Application ID |
 | `app_secret` | `str` | yes | — | Application secret |
 | `heartbeat_mode` | `str` | yes | — | `"SERVER"` or `"LOCAL"` (case-insensitive) |
-| `heartbeat_interval` | `int` | no | `900` | Seconds between heartbeats (any value ≥ 1) |
+| `heartbeat_interval` | `int` | no | `900` | Seconds between heartbeats (minimum `10`) |
 | `api_base_url` | `str` | no | `https://auth.authforge.cc` | API base URL |
 | `on_failure` | `Callable[[str, Optional[Exception]], None] \| None` | no | `None` | Called on login/heartbeat/network failure; if omitted, process exits via `os._exit(1)` (not used by `validate_license`) |
 | `request_timeout` | `int` | no | `15` | HTTP timeout (seconds) |
@@ -87,7 +87,7 @@ For Telegram/Discord bot flows, prefer immutable IDs (`tg:<user_id>`, `discord:<
 invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, blocked, rate_limited, replay_detected, session_expired, app_disabled, bad_request
 
 Notes:
-- `rate_limited` and `replay_detected` can only be returned from `/auth/validate`. Heartbeats are not IP rate-limited and do not enforce nonce replay.
+- `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
 
 ## Common patterns
 

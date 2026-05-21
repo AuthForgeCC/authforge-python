@@ -63,6 +63,7 @@ KNOWN_SERVER_ERRORS = {
     "session_expired",
     "revoke_requires_session",
     "bad_request",
+    "malformed_request",
     "system_error",
 }
 
@@ -93,8 +94,8 @@ class AuthForgeClient:
         mode = (heartbeat_mode or "").upper()
         if mode not in {"LOCAL", "SERVER"}:
             raise ValueError("heartbeat_mode must be LOCAL or SERVER")
-        if heartbeat_interval <= 0:
-            raise ValueError("heartbeat_interval must be > 0")
+        if heartbeat_interval < 10:
+            raise ValueError("heartbeat_interval must be >= 10")
 
         self.app_id = app_id
         self.app_secret = app_secret
