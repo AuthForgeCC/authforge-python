@@ -5,8 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from authforge import AuthForgeClient
 
@@ -28,7 +31,6 @@ class Ed25519VectorTests(unittest.TestCase):
             "test-app-id",
             "test-app-secret",
             self.public_key,
-            "LOCAL",
             heartbeat_interval=86400,
         )
 
@@ -65,7 +67,6 @@ class MultiKeyRotationTests(unittest.TestCase):
             "app",
             "secret",
             [self.DECOY_KEY, vectors["publicKey"]],
-            "LOCAL",
             heartbeat_interval=86400,
         )
         # Bogus key is first; verification must walk to the second entry.
@@ -78,7 +79,7 @@ class MultiKeyRotationTests(unittest.TestCase):
         case = next(c for c in vectors["cases"] if c["id"] == "validate_success")
         combined = f"{self.DECOY_KEY},{vectors['publicKey']}"
         client = AuthForgeClient(
-            "app", "secret", combined, "LOCAL", heartbeat_interval=86400
+            "app", "secret", combined, heartbeat_interval=86400
         )
         client._verify_signature(case["payload"], case["signature"])
 
@@ -89,12 +90,64 @@ class MultiKeyRotationTests(unittest.TestCase):
             "app",
             "secret",
             [self.DECOY_KEY],
-            "LOCAL",
             heartbeat_interval=86400,
         )
         with self.assertRaises(ValueError) as ctx:
             client._verify_signature(case["payload"], case["signature"])
         self.assertEqual(ctx.exception.args[0], "signature_mismatch")
+
+
+class ConstructorPolicyTests(unittest.TestCase):
+    """Grace period is the default; online check-ins are opt-in; the legacy
+    heartbeat_mode argument still works behind a DeprecationWarning."""
+
+    PUBLIC_KEY = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+    def test_default_is_grace_period(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client = AuthForgeClient("app", "secret", self.PUBLIC_KEY)
+        self.assertFalse(client.online_heartbeat)
+        self.assertEqual(client.heartbeat_mode, "LOCAL")
+        deprecations = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        self.assertEqual(deprecations, [])
+
+    def test_legacy_server_mode_maps_to_online_heartbeat(self) -> None:
+        with pytest.warns(DeprecationWarning):
+            client = AuthForgeClient(
+                "app", "secret", self.PUBLIC_KEY, heartbeat_mode="SERVER"
+            )
+        self.assertTrue(client.online_heartbeat)
+        self.assertEqual(client.heartbeat_mode, "SERVER")
+
+    def test_legacy_local_mode_maps_to_grace_period(self) -> None:
+        with pytest.warns(DeprecationWarning):
+            client = AuthForgeClient(
+                "app", "secret", self.PUBLIC_KEY, heartbeat_mode="LOCAL"
+            )
+        self.assertFalse(client.online_heartbeat)
+        self.assertEqual(client.heartbeat_mode, "LOCAL")
+
+    def test_online_heartbeat_flag_without_legacy_mode(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client = AuthForgeClient(
+                "app", "secret", self.PUBLIC_KEY, online_heartbeat=True
+            )
+        self.assertTrue(client.online_heartbeat)
+        self.assertEqual(client.heartbeat_mode, "SERVER")
+        deprecations = [
+            w for w in caught if issubclass(w.category, DeprecationWarning)
+        ]
+        self.assertEqual(deprecations, [])
+
+    def test_invalid_legacy_mode_still_raises(self) -> None:
+        with pytest.raises(ValueError, match="heartbeat_mode must be LOCAL or SERVER"):
+            AuthForgeClient(
+                "app", "secret", self.PUBLIC_KEY, heartbeat_mode="SOMETIMES"
+            )
 
 
 class ValidateLicenseTests(unittest.TestCase):
@@ -128,7 +181,6 @@ class ValidateLicenseTests(unittest.TestCase):
                 "app-id",
                 "app-secret",
                 vectors["publicKey"],
-                "LOCAL",
                 heartbeat_interval=86400,
             )
             result = client.validate_license("license-key")
@@ -157,7 +209,6 @@ class ValidateLicenseTests(unittest.TestCase):
                 "app-id",
                 "app-secret",
                 vectors["publicKey"],
-                "LOCAL",
                 heartbeat_interval=86400,
             )
             result = client.validate_license("bad")
@@ -198,7 +249,6 @@ class LoginFlowTests(unittest.TestCase):
                 "app-id",
                 "app-secret",
                 vectors["publicKey"],
-                "LOCAL",
                 heartbeat_interval=86400,
             )
             self.assertTrue(client.login("license-key"))
@@ -210,6 +260,14 @@ class LoginFlowTests(unittest.TestCase):
         self.assertEqual(client.get_app_variables(), {"tier": "pro"})
         self.assertEqual(client.get_license_variables(), {"region": "us-east-1"})
         self.assertEqual(payload["nonce"], nonce)
+
+        # Grace period check: re-verifies the stored signed session locally
+        # and must not touch the network before the session TTL expires.
+        with patch(
+            "authforge.urllib.request.urlopen",
+            side_effect=AssertionError("grace period check must not use the network"),
+        ):
+            client._grace_period_check()
 
 
 if __name__ == "__main__":

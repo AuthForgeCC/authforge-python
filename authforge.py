@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import warnings
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, TypedDict, Union
 
 from typing_extensions import NotRequired
@@ -74,13 +75,15 @@ class AuthForgeClient:
         app_id: str,
         app_secret: str,
         public_key: PublicKeyArg,
-        heartbeat_mode: str,
+        heartbeat_mode: Optional[str] = None,
         heartbeat_interval: int = 900,
         api_base_url: str = DEFAULT_API_BASE_URL,
         on_failure: Optional[Callable[[str, Optional[Exception]], None]] = None,
         request_timeout: int = 15,
         ttl_seconds: Optional[int] = None,
         hwid_override: Optional[str] = None,
+        *,
+        online_heartbeat: bool = False,
     ) -> None:
         if not app_id or not isinstance(app_id, str):
             raise ValueError("app_id must be a non-empty string")
@@ -91,9 +94,22 @@ class AuthForgeClient:
             raise ValueError(
                 "public_key must be a non-empty base64 string or list of base64 strings"
             )
-        mode = (heartbeat_mode or "").upper()
-        if mode not in {"LOCAL", "SERVER"}:
-            raise ValueError("heartbeat_mode must be LOCAL or SERVER")
+        # heartbeat_mode is a deprecated shim. By default the client runs on
+        # the grace period: after a successful activate/validate, the signed
+        # session keeps the app running without contacting AuthForge until
+        # the session TTL expires. Online check-ins (periodic
+        # /auth/heartbeat calls) are opt-in via online_heartbeat=True.
+        mode: Optional[str] = None
+        if heartbeat_mode:
+            mode = heartbeat_mode.upper()
+            if mode not in {"LOCAL", "SERVER"}:
+                raise ValueError("heartbeat_mode must be LOCAL or SERVER")
+            warnings.warn(
+                "heartbeat_mode is deprecated: use online_heartbeat=True for "
+                "online check-ins; the default is the grace period behavior",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if heartbeat_interval < 10:
             raise ValueError("heartbeat_interval must be >= 10")
 
@@ -104,13 +120,20 @@ class AuthForgeClient:
         # as `public_key` for callers that read it directly.
         self.public_keys: List[str] = public_key_list
         self.public_key = public_key_list[0]
-        self.heartbeat_mode = mode
+        # Effective policy: online check-ins are enabled either explicitly or
+        # via the legacy heartbeat_mode="SERVER" shim.
+        self.online_heartbeat: bool = bool(online_heartbeat) or mode == "SERVER"
+        # Back-compat attribute for callers that still read heartbeat_mode.
+        self.heartbeat_mode = "SERVER" if self.online_heartbeat else "LOCAL"
         self.heartbeat_interval = int(heartbeat_interval)
         self.api_base_url = api_base_url.rstrip("/")
         self.on_failure = on_failure
         self.request_timeout = request_timeout
+        # ttl_seconds is the grace period duration knob: how long the app
+        # keeps running on the signed session without contacting AuthForge.
         # None / 0 / negative means "let the server pick its default (24h)".
-        # Server clamps to [3600, 604800]; we don't duplicate the clamp here.
+        # The server clamps requested values to [3600, 604800] (1h to 7d);
+        # we don't duplicate the clamp here.
         self.ttl_seconds: Optional[int] = (
             int(ttl_seconds) if isinstance(ttl_seconds, int) and ttl_seconds > 0 else None
         )
@@ -264,10 +287,10 @@ class AuthForgeClient:
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self.heartbeat_interval):
             try:
-                if self.heartbeat_mode == "SERVER":
+                if self.online_heartbeat:
                     self._server_heartbeat()
                 else:
-                    self._local_heartbeat()
+                    self._grace_period_check()
             except Exception as exc:
                 self._fail("heartbeat_failed", exc)
                 break
@@ -294,7 +317,9 @@ class AuthForgeClient:
             context="heartbeat",
         )
 
-    def _local_heartbeat(self) -> None:
+    def _grace_period_check(self) -> None:
+        # Grace period enforcement: no network calls. Re-verify the stored
+        # signed session payload and fail once the session TTL has expired.
         with self._lock:
             raw_payload_b64 = self._raw_payload_b64
             signature = self._signature
