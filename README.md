@@ -10,6 +10,8 @@ Uses `cryptography` for Ed25519 verification. Works on Python 3.9+.
 2. **Run through the grace period.** By default the app keeps running on the signed session with no further network calls. A background check re-verifies the signature locally and fails when the session TTL expires. The grace period equals the session TTL: default 24h, and the server clamps requested values to 1h to 7d.
 3. **Optionally enable online check-ins.** With `online_heartbeat=True`, the SDK also calls `POST /auth/heartbeat` every `heartbeat_interval` seconds for fast revocation and concurrent-use detection.
 
+Separately, for machines that can **never** reach the internet, an operator can mint a signed **offline license file (`.authforge`)** in the AuthForge dashboard or Developer API. The SDK verifies it locally with your app public key: see [Offline license files](#offline-license-files-authforge).
+
 ## Features
 
 Everything in this list ships in `authforge.py` today:
@@ -19,6 +21,7 @@ Everything in this list ships in `authforge.py` today:
 - **Key rotation**: `public_key` accepts a single key, a list of keys, or a comma-separated string. The SDK trusts a signature that matches **any** key in the list, so you can roll the server-side signing key without breaking deployed clients.
 - **Grace period by default**: after one successful activation, the app runs on the signed session (no network) until the TTL expires.
 - **Online check-ins** (opt-in): periodic `/auth/heartbeat` calls for fast revocation and concurrent-use detection.
+- **Offline license files (`.authforge`)**: `login_from_file()` / `verify_license_file()` verify a cloud-minted, Ed25519-signed file with zero network access for air-gapped machines.
 - **Nonce anti-replay**: a fresh 128-bit nonce is sent on every request and the echoed nonce in the signed payload is checked before the response is accepted.
 - **HWID fingerprinting**: deterministic device hash from MAC + CPU + disk serial, with graceful per-component fallback.
 - **`hwid_override`**: bind to any identity instead of the machine (for example `tg:<id>`, `discord:<id>`).
@@ -126,6 +129,44 @@ first (primary) entry.
 
 Tune `ttl_seconds` to set the grace period duration (server default 24h, clamped to 1h to 7d).
 
+## Offline license files (`.authforge`)
+
+For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts online check-ins.
+
+| | Grace period (default) | Offline license file |
+| --- | --- | --- |
+| Needs network | Once, at `login()` | Never on the end machine |
+| What is verified | Signed *session* from `/auth/validate` | Signed *document* minted in the cloud |
+| Lifetime | Session TTL: 1h to 7d | Operator-chosen expiry or lifetime (perpetual licenses only) |
+| Revocation | Picked up at the next online validate / check-in | **Not** reachable: the file stays valid until its own expiry |
+| Cost | 1 credit per `login()` | 1 credit per mint; verifying is free |
+
+```python
+from authforge import AuthForgeClient
+
+client = AuthForgeClient(
+    app_id="YOUR_APP_ID",
+    app_secret="YOUR_APP_SECRET",  # unused for offline files but still required by the constructor
+    public_key="YOUR_PUBLIC_KEY",
+    on_failure=lambda reason, exc: print(reason, exc),
+)
+
+# 1. The customer sends you this value so you can bind the file to their machine:
+print("HWID:", client.get_hwid())
+
+# 2. Later, authorize from the minted file (path or armored text). No network.
+if client.login_from_file("license.authforge"):
+    info = client.get_offline_license()
+    print("Offline license OK until", info["expires_at"] or "forever")
+    print(client.get_license_variables())
+```
+
+Collect the HWID from the same SDK build that will load the file: fingerprints are not portable across SDKs or languages. After `login_from_file()`, `get_session_kind()` returns `"offline"` (`"online"` after `login()`, `None` when logged out).
+
+`verify_license_file()` (module function and client method) performs the same checks without touching client state. Failure codes, in check order: `bad_armor`, `bad_signature`, `unsupported_version`, `malformed_payload`, `wrong_app`, `expired`, `hwid_mismatch`. `login_from_file()` reports them through `on_failure("offline_login_failed", exc)` and returns `False`; it never calls `os._exit`.
+
+File format (version 1): PEM-style armor with informational headers, a base64 JSON payload (`v`, `appId`, `licenseKey`, `jti`, `kid`, `issuedAt`, `expiresAt`, `hwid` policy, optional label/variable snapshots) and a detached Ed25519 signature over the UTF-8 bytes of the base64 payload string - the same contract as `/auth/validate`. See `offline_license_vectors.json` for conformance vectors.
+
 ## Migrating from heartbeat_mode
 
 Earlier releases required `heartbeat_mode="LOCAL"` or `"SERVER"`. The argument is now optional and deprecated; it still works but emits a `DeprecationWarning`.
@@ -158,6 +199,11 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 | `login(license_key)` | `bool` | Activates: validates the key online and stores the signed session (`sessionToken`, `expiresIn`, `appVariables`, `licenseVariables`) |
 | `validate_license(license_key)` | `ValidateLicenseResult` | Same `/auth/validate` + signatures as `login`; does not store session or start background checks; returns a dict with `valid` / `code` and **never** calls `on_failure` or `os._exit` |
 | `self_ban(...)` | `dict` | Requests `/auth/selfban` to blacklist HWID/IP and optionally revoke (session-authenticated only) |
+| `login_from_file(path_or_text)` | `bool` | Authorizes from an offline `.authforge` file with no network; never starts background checks; failures go to `on_failure("offline_login_failed", …)` |
+| `verify_license_file(path_or_text, *, now=None)` | `VerifyLicenseFileResult` | Verifies a `.authforge` file with this client's app id / keys / HWID without changing state |
+| `get_offline_license()` | `dict \| None` | Metadata of the offline file in use (`jti`, `expires_at`, `hwid_policy`, …) |
+| `get_session_kind()` | `"online" \| "offline" \| None` | Which kind of session the client holds (`None` when logged out) |
+| `get_hwid()` | `str` | The HWID this client sends (or `hwid_override`); customers share it to receive a bound file |
 | `logout()` | `None` | Stops background checks and clears all session/auth state |
 | `is_authenticated()` | `bool` | True when an active authenticated session exists |
 | `get_session_data()` | `dict \| None` | Full decoded payload map |
@@ -217,6 +263,7 @@ client.self_ban(
 - Uses post-session mode when a session token is available (`session_token` arg or current SDK session).
 - Falls back to pre-session mode using `license_key` + nonce + app secret.
 - In pre-session mode, revoke is forced off client-side to avoid unsafe key revocations.
+- Not available after `login_from_file()`: offline sessions have no server session, so `self_ban()` with no explicit `license_key` / `session_token` raises `ValueError("offline_session")` without contacting the server.
 
 ## How It Works
 
@@ -239,7 +286,7 @@ For non-device identities (for example Telegram users), pass `hwid_override` suc
 
 ## Test Vectors
 
-The shared `test_vectors.json` file validates cross-language Ed25519 verification behavior.
+The shared `test_vectors.json` file validates cross-language Ed25519 verification behavior. `offline_license_vectors.json` (generated from a fixed test seed in the Node SDK repo) is the cross-SDK conformance suite for `.authforge` offline license files: good files plus the `bad_signature`, wrong key, `wrong_app`, `expired`, `hwid_mismatch`, `unsupported_version` and `bad_armor` rejects.
 
 ## Requirements
 

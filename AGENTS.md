@@ -7,10 +7,13 @@
 
 AuthForge is a license key validation service. Your app activates by sending a license key + hardware ID to `POST /auth/validate`; the server checks revocation, expiry, HWID binding, and credits, then returns an Ed25519-signed session with a TTL. By default the app then runs through the **grace period**: it keeps running on the signed session with no network calls, and a background check fails when the session TTL expires. Optionally, enable **online check-ins** (`online_heartbeat=True`): periodic `POST /auth/heartbeat` calls for fast revocation and concurrent-use detection. If the license is revoked or expired, the check-in fails and you handle it (typically exit the app).
 
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `login_from_file()` verifies it locally with the app public key and the machine HWID, with zero network calls. Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period.
+
 ## Billing model (so you can pick sensible intervals)
 
 - **1 `login()` or `validate_license()` = 1 credit** (one `/auth/validate` debit each).
 - **10 online check-ins = 1 credit** (billed on every 10th successful `/auth/heartbeat` per license). Grace period checks are local and free.
+- **1 offline file mint = 1 credit** (charged to the operator when the file is minted). `login_from_file()` / `verify_license_file()` cost nothing.
 - Keep `heartbeat_interval` at `>= 10` seconds (`900` / 15 min is the typical desktop default). `/auth/heartbeat` is limited to 6 requests/minute per license key, and revocations still take effect on the **next** check-in.
 
 ## Installation
@@ -89,6 +92,11 @@ The attribute `client.heartbeat_mode` still exists for back-compat and reflects 
 |--------|---------|-------------|
 | `login(license_key: str)` | `bool` | Activates: validates the license online, verifies signatures, starts the background check thread |
 | `validate_license(license_key: str)` | `ValidateLicenseResult` | Same validate + signatures as login; no session persistence or background checks; **never** calls `on_failure` or `os._exit` |
+| `login_from_file(path_or_text: str)` | `bool` | Offline mode: verifies a `.authforge` file locally (no network), authenticates the client, never starts background checks. Failures -> `on_failure("offline_login_failed", exc)` + `False`; never `os._exit` |
+| `verify_license_file(path_or_text, *, now=None)` | `VerifyLicenseFileResult` | Same offline checks without changing client state |
+| `get_offline_license()` | `dict \| None` | `jti`, `expires_at`, `hwid_policy`, … of the offline file in use |
+| `get_session_kind()` | `"online" \| "offline" \| None` | Kind of session the client holds; `None` when logged out |
+| `get_hwid()` | `str` | HWID this client sends; the customer reports it so the operator can mint a bound file |
 | `logout()` | `None` | Stops background checks and clears session state |
 | `is_authenticated()` | `bool` | Whether a session token is present and marked authenticated |
 | `get_session_data()` | `dict \| None` | Decoded signed payload map |
@@ -119,6 +127,24 @@ tier = vars_map.get("tier")
 client.logout()
 ```
 
+### Offline license file (air-gapped machine, only when asked)
+
+```python
+# Step 1 (customer machine): print the HWID so the operator can bind the file to it.
+print(client.get_hwid())
+
+# Step 2 (operator): mint the .authforge file in the dashboard or via
+# POST /v1/licenses/{licenseKey}/offline-files and deliver it out-of-band.
+
+# Step 3 (customer machine): authorize with the file. No network, no check-ins.
+if not client.login_from_file("license.authforge"):
+    # on_failure already received ("offline_login_failed", ValueError(code)) where code is one of
+    # bad_armor | bad_signature | unsupported_version | malformed_payload | wrong_app | expired | hwid_mismatch
+    sys.exit(1)
+```
+
+Offline file error codes (in check order): `bad_armor`, `bad_signature`, `unsupported_version`, `malformed_payload`, `wrong_app`, `expired`, `hwid_mismatch`.
+
 ### Custom error handling
 
 Server error codes appear as `ValueError` in the `exc` passed to `on_failure` from failed validation (e.g. `invalid_key`). Reasons are `login_failed`, `heartbeat_failed`, or `network_error`.
@@ -141,3 +167,11 @@ def on_failure(reason: str, exc: Optional[Exception]) -> None:
 - Do not skip the `on_failure` callback: without it, background check failures terminate the process via `os._exit(1)` without your cleanup
 - Do not call `login()` on every app action: call it once at startup; the grace period (or online check-ins) handles the rest
 - Do not pass `heartbeat_mode` in new code: it is deprecated. Use the default grace period, or `online_heartbeat=True` when you need fast revocation or concurrent-use detection
+- Do not treat the grace period as persistent offline licensing: it is session continuation after one successful online activation, and revocations are only picked up at the next online validate or check-in
+- Do not reach for `login_from_file()` unless the user explicitly needs air-gapped / offline-file licensing: the default is online `login()` + grace period
+- Do not expect an online revoke to disable an offline file that is already on a customer machine: the file stays valid until its own `expiresAt`; prefer short expiries and HWID-bound files
+- Do not mint or accept `hwid.mode: "any"` files casually: anyone who copies an unbound file has a working license
+- Do not call `login_from_file()` with another app's public key or app id: the file is rejected with `bad_signature` / `wrong_app` by design
+- Do not try to build `.authforge` files client-side: only the AuthForge cloud holds the signing key; there is no BYO issuer
+- Do not call `self_ban()` or any other online method after `login_from_file()`: an offline session has no server session (`get_session_kind()` is `"offline"`), so `self_ban()` raises `ValueError("offline_session")` without contacting the server and online check-ins never start; machines that can reach AuthForge should use online `login()`
+- Do not bind an offline file to an HWID reported by a different SDK or language: HWID fingerprints are not portable across SDKs, so collect the HWID from the exact SDK build that will load the file (or use the HWID override with an identifier you control)

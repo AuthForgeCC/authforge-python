@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import base64
 import json
+import tempfile
 import unittest
 import warnings
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from authforge import AuthForgeClient
+from authforge import AuthForgeClient, parse_license_file, verify_license_file
 
 
 def _load_test_vectors() -> dict:
@@ -268,6 +270,203 @@ class LoginFlowTests(unittest.TestCase):
             side_effect=AssertionError("grace period check must not use the network"),
         ):
             client._grace_period_check()
+
+
+# ---------------------------------------------------------------------------
+# Offline license files (`.authforge`)
+# ---------------------------------------------------------------------------
+
+
+def _load_offline_vectors() -> dict:
+    path = Path(__file__).resolve().parent / "offline_license_vectors.json"
+    with path.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+class OfflineLicenseFileTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.vectors = _load_offline_vectors()
+        cls.by_name = {c["name"]: c for c in cls.vectors["cases"]}
+        cls.good = cls.by_name["good_bound"]
+        # Client-level tests run against the wall clock: use the lifetime vector
+        # (expiresAt null) so they never turn into "expired" in 2027.
+        cls.lifetime = cls.by_name["good_lifetime"]
+
+    def _make_client(self, **overrides) -> tuple[AuthForgeClient, list]:
+        failures: list = []
+        kwargs = dict(
+            app_id=self.good["appId"],
+            app_secret="unused-offline",
+            public_key=self.good["publicKey"],
+            hwid_override=self.good["hwid"],
+            on_failure=lambda reason, exc: failures.append((reason, str(exc) if exc else None)),
+        )
+        kwargs.update(overrides)
+        return AuthForgeClient(**kwargs), failures
+
+    def test_every_vector_case_matches(self) -> None:
+        self.assertGreaterEqual(len(self.vectors["cases"]), 15)
+        for case in self.vectors["cases"]:
+            with self.subTest(case=case["name"]):
+                result = verify_license_file(
+                    case["file"],
+                    case["appId"],
+                    case["publicKey"],
+                    case["hwid"],
+                    now=_iso(case["now"]),
+                )
+                got = "ok" if result["ok"] else result["error"]
+                self.assertEqual(got, case["expect"])
+                if result["ok"] and "payload" in case:
+                    self.assertEqual(result["license"]["payload"], case["payload"])
+                    self.assertEqual(result["payload_base64"], case["payloadBase64"])
+                    self.assertEqual(result["signature_base64"], case["signatureBase64"])
+
+    def test_parse_recovers_canonical_signed_string(self) -> None:
+        parsed = parse_license_file(self.good["file"])
+        assert parsed is not None
+        self.assertEqual(parsed["payload_base64"], self.good["payloadBase64"])
+        self.assertEqual(parsed["signature_base64"], self.good["signatureBase64"])
+        self.assertEqual(parsed["headers"]["Version"], "1")
+        self.assertEqual(parsed["headers"]["App-Id"], self.good["appId"])
+        self.assertIsNone(parse_license_file("nope"))
+
+    def test_good_file_exposes_entitlements(self) -> None:
+        result = verify_license_file(
+            self.good["file"], self.good["appId"], self.good["publicKey"], self.good["hwid"],
+            now=_iso(self.good["now"]),
+        )
+        assert result["ok"]
+        lic = result["license"]
+        self.assertEqual(lic["license_key"], "TEST-KEY0-0000-0000")
+        self.assertEqual(lic["key_id"], "kid-test-0001")
+        self.assertEqual(lic["hwid_policy"], {"mode": "bound", "hwids": ["testhwid", "second-machine"]})
+        self.assertEqual(lic["license_variables"], {"tier": "pro", "seats": 3, "beta": True})
+        self.assertEqual(lic["app_variables"], {"theme": "dark"})
+        self.assertEqual(lic["label"], "Vector license")
+
+    def test_login_from_file_is_offline_and_starts_no_heartbeat(self) -> None:
+        client, failures = self._make_client()
+        self.assertEqual(client.get_hwid(), self.good["hwid"])
+        with patch(
+            "authforge.urllib.request.urlopen",
+            side_effect=AssertionError("offline files must not use the network"),
+        ):
+            self.assertTrue(client.login_from_file(self.lifetime["file"]))
+        self.assertTrue(client.is_authenticated())
+        self.assertEqual(client.get_session_kind(), "offline")
+        # No token sentinel: an offline session has no server session at all.
+        self.assertIsNone(client._session_token)
+        self.assertFalse(client._heartbeat_started)
+        self.assertIsNone(client._heartbeat_thread)
+        self.assertEqual(client.get_license_variables(), {"tier": "pro", "seats": 3, "beta": True})
+        self.assertEqual(client.get_app_variables(), {"theme": "dark"})
+        self.assertEqual(client.get_session_data()["licenseKey"], "TEST-KEY0-0000-0000")
+        offline = client.get_offline_license()
+        assert offline is not None
+        self.assertEqual(offline["jti"], "00000000-0000-4000-8000-000000000003")
+        self.assertIsNone(offline["expires_at"])
+        self.assertEqual(failures, [])
+
+        client.logout()
+        self.assertFalse(client.is_authenticated())
+        self.assertIsNone(client.get_session_kind())
+        self.assertIsNone(client.get_offline_license())
+
+    def test_offline_self_ban_is_local_error_and_never_posts(self) -> None:
+        # Closed port: any accidental network call fails loudly instead of hanging.
+        client, _ = self._make_client(api_base_url="http://127.0.0.1:9")
+        self.assertTrue(client.login_from_file(self.lifetime["file"]))
+        posts: list = []
+
+        def fake_post(path, body, **_kwargs):
+            posts.append((path, body))
+            return {"status": "ok"}
+
+        with patch.object(client, "_post_json", side_effect=fake_post):
+            with self.assertRaises(ValueError) as ctx:
+                client.self_ban()
+            self.assertEqual(str(ctx.exception), "offline_session")
+            with self.assertRaises(ValueError) as ctx:
+                client.self_ban(revoke_license=False, blacklist_hwid=False)
+            self.assertEqual(str(ctx.exception), "offline_session")
+            self.assertEqual(posts, [])
+            # Still authenticated offline afterwards; nothing was torn down.
+            self.assertTrue(client.is_authenticated())
+
+            # An explicit license_key is a request about a different credential
+            # and legitimately takes the pre-session path with a fresh nonce.
+            client.self_ban(license_key="OTHER-KEY0-0000-0000")
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][0], "/auth/selfban")
+        self.assertEqual(posts[0][1]["licenseKey"], "OTHER-KEY0-0000-0000")
+        self.assertFalse(posts[0][1]["revokeLicense"])
+        self.assertTrue(posts[0][1]["nonce"])
+        self.assertNotIn("sessionToken", posts[0][1])
+
+    def test_offline_heartbeat_entry_points_are_no_ops(self) -> None:
+        client, failures = self._make_client(online_heartbeat=True)
+        self.assertTrue(client.login_from_file(self.lifetime["file"]))
+        # Make the loop's wait return immediately so the offline guard is what ends it.
+        client.heartbeat_interval = 0
+        with patch(
+            "authforge.urllib.request.urlopen",
+            side_effect=AssertionError("offline files must not use the network"),
+        ):
+            # Even if something calls the internal entry points, an offline
+            # session never starts a thread, never checks in and never runs
+            # the grace check.
+            client._start_heartbeat_once()
+            self.assertFalse(client._heartbeat_started)
+            self.assertIsNone(client._heartbeat_thread)
+            client._heartbeat_loop()
+        self.assertTrue(client.is_authenticated())
+        self.assertEqual(client.get_session_kind(), "offline")
+        self.assertEqual(failures, [])
+
+    def test_unsupported_version_bool_vector_is_rejected(self) -> None:
+        case = self.by_name["unsupported_version_bool"]
+        result = verify_license_file(case["file"], case["appId"], case["publicKey"], case["hwid"], now=_iso(case["now"]))
+        self.assertEqual(result, {"ok": False, "error": "unsupported_version"})
+
+    def test_login_from_file_rejects_via_on_failure(self) -> None:
+        cases = [
+            ({}, self.by_name["bad_signature_tampered_body"]["file"], "bad_signature"),
+            ({"public_key": self.vectors["keys"]["wrongPublicKey"]}, self.lifetime["file"], "bad_signature"),
+            ({}, self.by_name["expired"]["file"], "expired"),
+            ({"hwid_override": "otherhwid"}, self.lifetime["file"], "hwid_mismatch"),
+            ({"app_id": "other-app"}, self.lifetime["file"], "wrong_app"),
+            ({}, self.by_name["unsupported_version"]["file"], "unsupported_version"),
+        ]
+        for overrides, file_text, expected in cases:
+            with self.subTest(expected=expected):
+                client, failures = self._make_client(**overrides)
+                self.assertFalse(client.login_from_file(file_text))
+                self.assertEqual(failures, [("offline_login_failed", expected)])
+                self.assertFalse(client.is_authenticated())
+
+    def test_login_from_file_unreadable_input_never_exits(self) -> None:
+        client, failures = self._make_client()
+        with patch("authforge.os._exit", side_effect=AssertionError("must not exit")):
+            self.assertFalse(client.login_from_file("garbage-not-a-path"))
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0][0], "offline_login_failed")
+
+    def test_login_from_file_reads_from_disk_and_verify_is_side_effect_free(self) -> None:
+        client, _ = self._make_client()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "license.authforge"
+            path.write_text(self.lifetime["file"], encoding="utf-8")
+            checked = client.verify_license_file(str(path))
+            self.assertTrue(checked["ok"])
+            self.assertFalse(client.is_authenticated())
+            self.assertTrue(client.login_from_file(str(path)))
+            self.assertTrue(client.is_authenticated())
 
 
 if __name__ == "__main__":

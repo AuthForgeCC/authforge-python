@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import subprocess
 import socket
@@ -12,6 +13,7 @@ import urllib.error
 import urllib.request
 import uuid
 import warnings
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, TypedDict, Union
 
 from typing_extensions import NotRequired
@@ -47,6 +49,291 @@ class ValidateLicenseFailure(TypedDict):
 
 
 ValidateLicenseResult = Union[ValidateLicenseSuccess, ValidateLicenseFailure]
+
+
+# ---------------------------------------------------------------------------
+# Offline license files (`.authforge`)
+#
+# A cloud-minted, Ed25519-signed document for machines that never phone home.
+# This is a SEPARATE mode from the grace period: the grace period continues a
+# signed session after one online activation, while an offline file is
+# verified locally with only the app public key and the machine HWID. Nothing
+# here performs network I/O or starts online check-ins.
+# ---------------------------------------------------------------------------
+
+OFFLINE_LICENSE_FILE_VERSION = 1
+# How a client authenticated: server session (login) or local file (login_from_file).
+SessionKind = Literal["online", "offline"]
+_OFFLINE_BEGIN_LICENSE = "-----BEGIN AUTHFORGE LICENSE-----"
+_OFFLINE_END_LICENSE = "-----END AUTHFORGE LICENSE-----"
+_OFFLINE_BEGIN_SIGNATURE = "-----BEGIN AUTHFORGE SIGNATURE-----"
+_OFFLINE_END_SIGNATURE = "-----END AUTHFORGE SIGNATURE-----"
+_OFFLINE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+OFFLINE_LICENSE_ERRORS = (
+    "bad_armor",
+    "bad_signature",
+    "unsupported_version",
+    "malformed_payload",
+    "wrong_app",
+    "expired",
+    "hwid_mismatch",
+)
+
+
+class OfflineLicense(TypedDict):
+    app_id: str
+    license_key: str
+    jti: str
+    key_id: str
+    issued_at: str
+    expires_at: Optional[str]
+    hwid_policy: Dict[str, Any]
+    label: NotRequired[str]
+    license_expires_at: NotRequired[Optional[str]]
+    license_variables: Optional[Dict[str, Any]]
+    app_variables: Optional[Dict[str, Any]]
+    payload: Dict[str, Any]
+
+
+class VerifyLicenseFileSuccess(TypedDict):
+    ok: Literal[True]
+    license: OfflineLicense
+    payload_base64: str
+    signature_base64: str
+
+
+class VerifyLicenseFileFailure(TypedDict):
+    ok: Literal[False]
+    error: str
+
+
+VerifyLicenseFileResult = Union[VerifyLicenseFileSuccess, VerifyLicenseFileFailure]
+
+
+class ParsedLicenseFile(TypedDict):
+    headers: Dict[str, str]
+    payload_base64: str
+    signature_base64: str
+
+
+def parse_license_file(text: str) -> Optional[ParsedLicenseFile]:
+    """Parse armored ``.authforge`` text.
+
+    Returns ``None`` when the armor is malformed. Tolerates CRLF, a UTF-8 BOM,
+    any re-wrapping of the base64 body and text before/after the armor.
+    ``payload_base64`` is exactly the string the signature covers.
+    """
+    if not isinstance(text, str):
+        return None
+    normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+
+    def _find(marker: str, start: int) -> int:
+        for i in range(start, len(lines)):
+            if lines[i].strip() == marker:
+                return i
+        return -1
+
+    begin_idx = _find(_OFFLINE_BEGIN_LICENSE, 0)
+    if begin_idx == -1:
+        return None
+    end_idx = _find(_OFFLINE_END_LICENSE, begin_idx + 1)
+    if end_idx == -1:
+        return None
+    sig_begin_idx = _find(_OFFLINE_BEGIN_SIGNATURE, end_idx + 1)
+    if sig_begin_idx == -1:
+        return None
+    sig_end_idx = _find(_OFFLINE_END_SIGNATURE, sig_begin_idx + 1)
+    if sig_end_idx == -1:
+        return None
+
+    block = lines[begin_idx + 1 : end_idx]
+    blank_idx = -1
+    for i, line in enumerate(block):
+        if line.strip() == "":
+            blank_idx = i
+            break
+    if blank_idx == -1:
+        return None
+
+    headers: Dict[str, str] = {}
+    for raw in block[:blank_idx]:
+        line = raw.strip()
+        colon = line.find(":")
+        if colon <= 0:
+            return None
+        headers[line[:colon].strip()] = line[colon + 1 :].strip()
+
+    payload_base64 = re.sub(r"\s+", "", "".join(block[blank_idx + 1 :]))
+    signature_base64 = re.sub(r"\s+", "", "".join(lines[sig_begin_idx + 1 : sig_end_idx]))
+    if not payload_base64 or not _OFFLINE_BASE64_RE.match(payload_base64):
+        return None
+    if not signature_base64 or not _OFFLINE_BASE64_RE.match(signature_base64):
+        return None
+    return {
+        "headers": headers,
+        "payload_base64": payload_base64,
+        "signature_base64": signature_base64,
+    }
+
+
+def _parse_iso8601_ms(value: str) -> Optional[float]:
+    """ISO-8601 -> epoch milliseconds (UTC). Returns None when unparseable."""
+    text = value.strip()
+    if text.endswith("Z") or text.endswith("z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp() * 1000.0
+
+
+def _offline_payload_shape_ok(payload: Dict[str, Any]) -> bool:
+    if payload.get("typ") != "authforge-license":
+        return False
+    for field in ("appId", "licenseKey", "jti", "kid", "issuedAt"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value:
+            return False
+    # `expiresAt` must be present: an explicit null means lifetime, absence is
+    # a malformed document (never emitted by the cloud minter).
+    if "expiresAt" not in payload:
+        return False
+    expires_at = payload["expiresAt"]
+    if expires_at is not None and (not isinstance(expires_at, str) or not expires_at):
+        return False
+    hwid = payload.get("hwid")
+    if not isinstance(hwid, dict):
+        return False
+    mode = hwid.get("mode")
+    if mode == "bound":
+        hwids = hwid.get("hwids")
+        if not isinstance(hwids, list) or not hwids:
+            return False
+        if not all(isinstance(h, str) and h for h in hwids):
+            return False
+    elif mode != "any":
+        return False
+    return True
+
+
+def verify_license_file(
+    file: str,
+    app_id: str,
+    public_key: PublicKeyArg,
+    hwid: Optional[str] = None,
+    *,
+    now: Optional[Union[datetime, float, int]] = None,
+) -> VerifyLicenseFileResult:
+    """Verify an offline ``.authforge`` license file with NO network access.
+
+    Check order (fixed across every SDK): ``bad_armor`` -> ``bad_signature`` ->
+    ``unsupported_version`` -> ``malformed_payload`` -> ``wrong_app`` ->
+    ``expired`` -> ``hwid_mismatch``. The signature is verified before the
+    payload JSON is decoded so a forged file never reaches the parser.
+
+    ``file`` is the armored text. ``public_key`` accepts the same forms as the
+    client constructor (single key, list, or comma-separated). ``now`` may be a
+    ``datetime`` or epoch seconds (tests).
+    """
+    parsed = parse_license_file(file)
+    if parsed is None:
+        return {"ok": False, "error": "bad_armor"}
+
+    keys = AuthForgeClient._normalize_public_key_list(public_key)
+    if not _verify_offline_signature(parsed["payload_base64"], parsed["signature_base64"], keys):
+        return {"ok": False, "error": "bad_signature"}
+
+    try:
+        payload = json.loads(base64.b64decode(parsed["payload_base64"]).decode("utf-8"))
+    except Exception:
+        return {"ok": False, "error": "malformed_payload"}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "malformed_payload"}
+    version = payload.get("v")
+    # ``True == 1`` in Python, so the bool check is required for parity with the
+    # other SDKs, which all demand a JSON number here.
+    if isinstance(version, bool) or version != OFFLINE_LICENSE_FILE_VERSION:
+        return {"ok": False, "error": "unsupported_version"}
+    if not _offline_payload_shape_ok(payload):
+        return {"ok": False, "error": "malformed_payload"}
+
+    if payload["appId"] != app_id:
+        return {"ok": False, "error": "wrong_app"}
+
+    if isinstance(now, datetime):
+        now_ms = now.timestamp() * 1000.0
+    elif isinstance(now, (int, float)):
+        now_ms = float(now) * 1000.0
+    else:
+        now_ms = time.time() * 1000.0
+    expires_at = payload["expiresAt"]
+    if expires_at is not None:
+        exp_ms = _parse_iso8601_ms(expires_at)
+        if exp_ms is None or exp_ms <= now_ms:
+            return {"ok": False, "error": "expired"}
+
+    hwid_policy = payload["hwid"]
+    if hwid_policy["mode"] == "bound":
+        local = hwid.strip() if isinstance(hwid, str) else ""
+        if not local or local not in hwid_policy["hwids"]:
+            return {"ok": False, "error": "hwid_mismatch"}
+
+    license_info: OfflineLicense = {
+        "app_id": payload["appId"],
+        "license_key": payload["licenseKey"],
+        "jti": payload["jti"],
+        "key_id": payload["kid"],
+        "issued_at": payload["issuedAt"],
+        "expires_at": expires_at,
+        "hwid_policy": (
+            {"mode": "bound", "hwids": list(hwid_policy["hwids"])}
+            if hwid_policy["mode"] == "bound"
+            else {"mode": "any"}
+        ),
+        "license_variables": dict(payload["licenseVariables"])
+        if isinstance(payload.get("licenseVariables"), dict)
+        else None,
+        "app_variables": dict(payload["appVariables"])
+        if isinstance(payload.get("appVariables"), dict)
+        else None,
+        "payload": dict(payload),
+    }
+    if isinstance(payload.get("label"), str):
+        license_info["label"] = payload["label"]
+    if "licenseExpiresAt" in payload:
+        le = payload["licenseExpiresAt"]
+        license_info["license_expires_at"] = le if isinstance(le, str) else None
+    return {
+        "ok": True,
+        "license": license_info,
+        "payload_base64": parsed["payload_base64"],
+        "signature_base64": parsed["signature_base64"],
+    }
+
+
+def _verify_offline_signature(payload_base64: str, signature_base64: str, keys: Sequence[str]) -> bool:
+    try:
+        signature_bytes = base64.b64decode(signature_base64, validate=True)
+    except Exception:
+        return False
+    if len(signature_bytes) != 64:
+        return False
+    message = payload_base64.encode("utf-8")
+    for key_b64 in keys:
+        try:
+            raw = base64.b64decode(key_b64, validate=True)
+            if len(raw) != 32:
+                continue
+            Ed25519PublicKey.from_public_bytes(raw).verify(signature_bytes, message)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 KNOWN_SERVER_ERRORS = {
@@ -145,6 +432,10 @@ class AuthForgeClient:
 
         self._license_key: Optional[str] = None
         self._session_token: Optional[str] = None
+        # "online" after login()/validate, "offline" after login_from_file(),
+        # None when logged out. Drives is_authenticated(), self_ban() and the
+        # heartbeat guard so the two modes can never be confused.
+        self._session_kind: Optional[SessionKind] = None
         self._session_expires_in: Optional[int] = None
         self._last_nonce: Optional[str] = None
         self._raw_payload_b64: Optional[str] = None
@@ -154,10 +445,118 @@ class AuthForgeClient:
         self._app_variables: Optional[Dict[str, Any]] = None
         self._license_variables: Optional[Dict[str, Any]] = None
         self._authenticated = False
+        self._offline_license: Optional[Dict[str, Any]] = None
         self._hwid = self._resolve_hwid(hwid_override)
         self._ed25519_public_keys: List[Ed25519PublicKey] = [
             self._load_public_key(k) for k in public_key_list
         ]
+
+    def get_hwid(self) -> str:
+        """The HWID this client sends to AuthForge (or ``hwid_override``).
+
+        Customers on air-gapped machines report this value to the operator so
+        an offline ``.authforge`` file can be bound to it.
+        """
+        return self._hwid
+
+    def login_from_file(self, path_or_text: str) -> bool:
+        """Authorize from a cloud-minted offline license file (``.authforge``)
+        with NO network access. Accepts a filesystem path or the armored text.
+
+        On success the client is authenticated (:meth:`is_authenticated`,
+        :meth:`get_session_data`, :meth:`get_app_variables`,
+        :meth:`get_license_variables` work) and :meth:`get_offline_license`
+        describes the file. No grace-period thread and no online check-ins are
+        started - the file's own ``expiresAt`` is the only clock. Online
+        :meth:`login` is untouched.
+
+        Failures are reported through ``on_failure("offline_login_failed", exc)``
+        and return ``False``; unlike :meth:`login` this never calls
+        ``os._exit`` - an unreadable file should not kill an air-gapped
+        process without a chance to show the user why.
+        """
+        try:
+            text = self._read_license_file_input(path_or_text)
+        except Exception as exc:
+            self._fail_soft("offline_login_failed", exc)
+            return False
+        result = verify_license_file(text, self.app_id, self.public_keys, self._hwid)
+        if not result["ok"]:
+            self._fail_soft("offline_login_failed", ValueError(result["error"]))
+            return False
+        self._apply_offline_license(result)
+        return True
+
+    def verify_license_file(
+        self,
+        path_or_text: str,
+        *,
+        now: Optional[Union[datetime, float, int]] = None,
+    ) -> VerifyLicenseFileResult:
+        """Verify a ``.authforge`` file with this client's app id, public
+        key(s) and HWID without touching session state. Never raises for bad
+        input."""
+        try:
+            text = self._read_license_file_input(path_or_text)
+        except Exception as exc:
+            return {"ok": False, "error": f"read_error: {exc}"}
+        return verify_license_file(text, self.app_id, self.public_keys, self._hwid, now=now)
+
+    def get_offline_license(self) -> Optional[Dict[str, Any]]:
+        """Details of the offline file the client authenticated with, or ``None``."""
+        with self._lock:
+            return dict(self._offline_license) if self._offline_license is not None else None
+
+    @staticmethod
+    def _read_license_file_input(path_or_text: str) -> str:
+        if not isinstance(path_or_text, str) or not path_or_text:
+            raise ValueError("license file must be a path or the armored text")
+        if _OFFLINE_BEGIN_LICENSE in path_or_text:
+            return path_or_text
+        with open(path_or_text, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _apply_offline_license(self, result: VerifyLicenseFileSuccess) -> None:
+        # Stop any online session first so the two modes never overlap.
+        self.logout()
+        lic = result["license"]
+        expires_at = lic["expires_at"]
+        expires_ms = _parse_iso8601_ms(expires_at) if isinstance(expires_at, str) else None
+        with self._lock:
+            self._license_key = lic["license_key"]
+            # Offline files carry no server session token. The explicit session
+            # kind (not a token sentinel) is what makes is_authenticated() true
+            # and keeps self_ban()/heartbeats from ever contacting the server.
+            self._session_token = None
+            self._session_kind = "offline"
+            self._session_expires_in = int(expires_ms / 1000) if expires_ms is not None else None
+            self._raw_payload_b64 = result["payload_base64"]
+            self._signature = result["signature_base64"]
+            self._key_id = lic["key_id"]
+            self._session_data = dict(lic["payload"])
+            self._app_variables = lic["app_variables"]
+            self._license_variables = lic["license_variables"]
+            summary: Dict[str, Any] = {
+                "license_key": lic["license_key"],
+                "jti": lic["jti"],
+                "key_id": lic["key_id"],
+                "issued_at": lic["issued_at"],
+                "expires_at": expires_at,
+                "hwid_policy": lic["hwid_policy"],
+            }
+            if "label" in lic:
+                summary["label"] = lic["label"]
+            if "license_expires_at" in lic:
+                summary["license_expires_at"] = lic["license_expires_at"]
+            self._offline_license = summary
+            self._authenticated = True
+
+    def _fail_soft(self, reason: str, exc: Optional[Exception]) -> None:
+        if self.on_failure is not None:
+            try:
+                self.on_failure(reason, exc)
+            except Exception:
+                pass
 
     def login(self, license_key: str) -> bool:
         if not license_key or not isinstance(license_key, str):
@@ -226,10 +625,23 @@ class AuthForgeClient:
             if isinstance(session_token, str) and session_token.strip()
             else None
         )
+        explicit_license = (
+            license_key.strip()
+            if isinstance(license_key, str) and license_key.strip()
+            else None
+        )
         with self._lock:
             current_session = self._session_token
             current_license = self._license_key
+            current_kind = self._session_kind
             hwid = self._hwid
+
+        # An offline session has no server session and must never phone home
+        # on its own. Callers who pass an explicit license_key/session_token
+        # are asking about a *different* credential and get the normal paths.
+        if current_kind == "offline" and resolved_session is None and explicit_license is None:
+            raise ValueError("offline_session")
+
         resolved_session = resolved_session or current_session
 
         if resolved_session:
@@ -246,12 +658,7 @@ class AuthForgeClient:
                 raise ValueError(self._extract_server_error(response_obj))
             return response_obj
 
-        resolved_license = (
-            license_key.strip()
-            if isinstance(license_key, str) and license_key.strip()
-            else None
-        )
-        resolved_license = resolved_license or current_license
+        resolved_license = explicit_license or current_license
         if not resolved_license:
             raise ValueError("missing_license_key")
 
@@ -273,7 +680,9 @@ class AuthForgeClient:
 
     def _start_heartbeat_once(self) -> None:
         with self._lock:
-            if self._heartbeat_started:
+            # Offline sessions have no grace period and no online check-ins:
+            # the file's own expires_at is the only clock. Never start a thread.
+            if self._heartbeat_started or self._session_kind == "offline":
                 return
             self._heartbeat_stop.clear()
             self._heartbeat_started = True
@@ -286,6 +695,10 @@ class AuthForgeClient:
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self.heartbeat_interval):
+            with self._lock:
+                offline = self._session_kind == "offline"
+            if offline:
+                return
             try:
                 if self.online_heartbeat:
                     self._server_heartbeat()
@@ -436,6 +849,7 @@ class AuthForgeClient:
             if license_key is not None:
                 self._license_key = license_key
             self._session_token = parsed["session_token"]
+            self._session_kind = "online"
             self._session_expires_in = int(parsed["expires_in"])
             self._last_nonce = expected_nonce
             self._raw_payload_b64 = parsed["raw_payload_b64"]
@@ -715,6 +1129,7 @@ class AuthForgeClient:
         with self._lock:
             self._license_key = None
             self._session_token = None
+            self._session_kind = None
             self._session_expires_in = None
             self._last_nonce = None
             self._raw_payload_b64 = None
@@ -724,12 +1139,25 @@ class AuthForgeClient:
             self._app_variables = None
             self._license_variables = None
             self._authenticated = False
+            self._offline_license = None
             self._heartbeat_started = False
             self._heartbeat_thread = None
 
     def is_authenticated(self) -> bool:
+        """True for an online session (:meth:`login`) or an offline one
+        (:meth:`login_from_file`)."""
         with self._lock:
-            return self._authenticated and bool(self._session_token)
+            if not self._authenticated:
+                return False
+            if self._session_kind == "online":
+                return bool(self._session_token)
+            return self._session_kind == "offline"
+
+    def get_session_kind(self) -> Optional[SessionKind]:
+        """``"online"`` after :meth:`login`, ``"offline"`` after
+        :meth:`login_from_file`, ``None`` when logged out."""
+        with self._lock:
+            return self._session_kind
 
     def get_session_data(self) -> Optional[Dict[str, Any]]:
         with self._lock:
