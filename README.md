@@ -82,7 +82,7 @@ client = AuthForgeClient(
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `app_id` | str | required | Your application ID from the AuthForge dashboard |
-| `app_secret` | str | required | Your application secret from the AuthForge dashboard |
+| `app_secret` | str | required for online APIs; `None` / `""` for `login_from_file` only | Your application secret from the AuthForge dashboard. Do not ship it in air-gapped binaries. |
 | `public_key` | `str \| Sequence[str]` | required | App Ed25519 public key(s) (base64) from dashboard. Pass one key, a list of keys, or a comma-separated string to trust multiple keys during rotation (see [Key rotation](#key-rotation)). |
 | `heartbeat_mode` | `str \| None` | `None` | Deprecated shim (see [Migrating from heartbeat_mode](#migrating-from-heartbeat_mode)). Use `online_heartbeat` instead. |
 | `heartbeat_interval` | int | `900` | Seconds between background checks (minimum `10`; default 15 min). Applies to both grace period checks and online check-ins. |
@@ -131,7 +131,7 @@ Tune `ttl_seconds` to set the grace period duration (server default 24h, clamped
 
 ## Offline license files (`.authforge`)
 
-For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts online check-ins.
+For machines that never connect to the internet, the operator mints a **signed offline license file** in the AuthForge dashboard (License page -> *Mint .authforge file*) or via `POST /v1/licenses/{licenseKey}/offline-files`. The file is a standalone Ed25519-signed document; the SDK verifies it with **only** your app public key and the machine HWID. It never contacts AuthForge and never starts online check-ins. Pass `app_secret=None` (or `""`) so the air-gapped binary does not contain the App Secret.
 
 | | Grace period (default) | Offline license file |
 | --- | --- | --- |
@@ -146,7 +146,7 @@ from authforge import AuthForgeClient
 
 client = AuthForgeClient(
     app_id="YOUR_APP_ID",
-    app_secret="YOUR_APP_SECRET",  # unused for offline files but still required by the constructor
+    app_secret=None,  # login_from_file does not use the App Secret; do not ship it in air-gapped builds
     public_key="YOUR_PUBLIC_KEY",
     on_failure=lambda reason, exc: print(reason, exc),
 )

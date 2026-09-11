@@ -301,7 +301,7 @@ class OfflineLicenseFileTests(unittest.TestCase):
         failures: list = []
         kwargs = dict(
             app_id=self.good["appId"],
-            app_secret="unused-offline",
+            app_secret=None,
             public_key=self.good["publicKey"],
             hwid_override=self.good["hwid"],
             on_failure=lambda reason, exc: failures.append((reason, str(exc) if exc else None)),
@@ -378,9 +378,28 @@ class OfflineLicenseFileTests(unittest.TestCase):
         self.assertIsNone(client.get_session_kind())
         self.assertIsNone(client.get_offline_license())
 
+    def test_login_from_file_does_not_need_app_secret(self) -> None:
+        client, failures = self._make_client(app_secret="")
+        self.assertEqual(client.app_secret, "")
+        self.assertTrue(client.login_from_file(self.lifetime["file"]))
+        self.assertTrue(client.is_authenticated())
+        self.assertEqual(failures, [])
+
+    def test_login_requires_app_secret(self) -> None:
+        client, _ = self._make_client(app_secret=None)
+        with self.assertRaises(ValueError) as ctx:
+            client.login("XXXX-XXXX-XXXX-XXXX")
+        self.assertIn("app_secret is required for online APIs", str(ctx.exception))
+        self.assertFalse(client.is_authenticated())
+
     def test_offline_self_ban_is_local_error_and_never_posts(self) -> None:
         # Closed port: any accidental network call fails loudly instead of hanging.
-        client, _ = self._make_client(api_base_url="http://127.0.0.1:9")
+        client, _ = self._make_client(
+            api_base_url="http://127.0.0.1:9",
+            # Explicit-license SelfBan is an online API; this test covers that
+            # dual-mode path. Offline-only clients omit the secret entirely.
+            app_secret="online-selfban",
+        )
         self.assertTrue(client.login_from_file(self.lifetime["file"]))
         posts: list = []
 

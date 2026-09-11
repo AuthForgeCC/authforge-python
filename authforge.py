@@ -360,7 +360,7 @@ class AuthForgeClient:
     def __init__(
         self,
         app_id: str,
-        app_secret: str,
+        app_secret: Optional[str],
         public_key: PublicKeyArg,
         heartbeat_mode: Optional[str] = None,
         heartbeat_interval: int = 900,
@@ -374,8 +374,12 @@ class AuthForgeClient:
     ) -> None:
         if not app_id or not isinstance(app_id, str):
             raise ValueError("app_id must be a non-empty string")
-        if not app_secret or not isinstance(app_secret, str):
-            raise ValueError("app_secret must be a non-empty string")
+        # Empty/None is valid for offline-only clients (login_from_file).
+        # Online APIs (login, validate_license, self_ban) still require a secret.
+        if app_secret is None:
+            app_secret = ""
+        elif not isinstance(app_secret, str):
+            raise ValueError("app_secret must be a string or None")
         public_key_list = self._normalize_public_key_list(public_key)
         if not public_key_list:
             raise ValueError(
@@ -558,9 +562,16 @@ class AuthForgeClient:
             except Exception:
                 pass
 
+    def _require_app_secret(self) -> None:
+        if not self.app_secret:
+            raise ValueError(
+                "app_secret is required for online APIs; omit it only when using login_from_file"
+            )
+
     def login(self, license_key: str) -> bool:
         if not license_key or not isinstance(license_key, str):
             raise ValueError("license_key must be a non-empty string")
+        self._require_app_secret()
 
         try:
             self._validate_and_store(license_key)
@@ -575,6 +586,7 @@ class AuthForgeClient:
         session state or starting the heartbeat thread."""
         if not license_key or not isinstance(license_key, str):
             raise ValueError("license_key must be a non-empty string")
+        self._require_app_secret()
         try:
             body: Dict[str, Any] = {
                 "appId": self.app_id,
@@ -661,6 +673,7 @@ class AuthForgeClient:
         resolved_license = explicit_license or current_license
         if not resolved_license:
             raise ValueError("missing_license_key")
+        self._require_app_secret()
 
         body = {
             "appId": self.app_id,
