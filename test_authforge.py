@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import tempfile
 import unittest
 import warnings
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import authforge
 from authforge import AuthForgeClient, format_activation_request, parse_license_file, verify_license_file
 
 
@@ -547,6 +549,12 @@ class ActivationRequestTests(unittest.TestCase):
         self.assertIn("BEGIN AUTHFORGE ACTIVATION REQUEST", text)
         self.assertNotIn("BEGIN AUTHFORGE LICENSE", text)
         self.assertNotIn("machineName", text)
+
+    def test_sdk_tag_matches_pyproject_version(self) -> None:
+        text = (Path(__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'(?m)^version = "([^"]+)"', text)
+        self.assertIsNotNone(match)
+        self.assertEqual(authforge._SDK_TAG, f"python/{match.group(1)}")
 
     def test_write_activation_request(self) -> None:
         client = AuthForgeClient(
