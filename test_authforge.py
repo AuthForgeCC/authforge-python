@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from authforge import AuthForgeClient, parse_license_file, verify_license_file
+from authforge import AuthForgeClient, format_activation_request, parse_license_file, verify_license_file
 
 
 def _load_test_vectors() -> dict:
@@ -486,6 +486,91 @@ class OfflineLicenseFileTests(unittest.TestCase):
             self.assertFalse(client.is_authenticated())
             self.assertTrue(client.login_from_file(str(path)))
             self.assertTrue(client.is_authenticated())
+
+
+class ActivationRequestTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        path = Path(__file__).resolve().parent / "activation_request_vectors.json"
+        with path.open(encoding="utf-8") as handle:
+            cls.vectors = json.load(handle)
+
+    def test_create_activation_request_matches_vectors(self) -> None:
+        dummy_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        for case in self.vectors["cases"]:
+            inputs = case.get("inputs")
+            if not inputs:
+                continue
+            with self.subTest(case=case["name"]):
+                client = AuthForgeClient(
+                    app_id=inputs["appId"],
+                    app_secret=None,
+                    public_key=dummy_key,
+                    hwid_override=inputs["hwid"],
+                )
+                got = client.create_activation_request(
+                    created_at=inputs["createdAt"],
+                    omit_os="os" not in inputs,
+                    omit_sdk="sdk" not in inputs,
+                    include_machine_name=bool(inputs.get("machineName")),
+                    machine_name=inputs.get("machineName"),
+                    os=inputs.get("os"),
+                    sdk=inputs.get("sdk"),
+                    license_key=inputs.get("licenseKey") or "",
+                )
+                self.assertEqual(got, case["file"])
+                self.assertEqual(
+                    format_activation_request(
+                        app_id=inputs["appId"],
+                        hwid=inputs["hwid"],
+                        created_at=inputs["createdAt"],
+                        machine_name=inputs.get("machineName"),
+                        os=inputs.get("os"),
+                        sdk=inputs.get("sdk"),
+                        license_key=inputs.get("licenseKey"),
+                    ),
+                    case["file"],
+                )
+
+    def test_works_without_app_secret_before_login(self) -> None:
+        client = AuthForgeClient(
+            app_id="test-app",
+            app_secret=None,
+            public_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            hwid_override="testhwid",
+        )
+        text = client.create_activation_request(
+            created_at="2026-09-11T12:00:00.000Z",
+            omit_os=True,
+            omit_sdk=True,
+        )
+        self.assertIn("BEGIN AUTHFORGE ACTIVATION REQUEST", text)
+        self.assertNotIn("BEGIN AUTHFORGE LICENSE", text)
+        self.assertNotIn("machineName", text)
+
+    def test_write_activation_request(self) -> None:
+        client = AuthForgeClient(
+            app_id="test-app",
+            app_secret=None,
+            public_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            hwid_override="testhwid",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "machine.authforge-request"
+            client.write_activation_request(
+                str(path),
+                created_at="2026-09-11T12:00:00.000Z",
+                omit_os=True,
+                omit_sdk=True,
+            )
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                client.create_activation_request(
+                    created_at="2026-09-11T12:00:00.000Z",
+                    omit_os=True,
+                    omit_sdk=True,
+                ),
+            )
 
 
 if __name__ == "__main__":

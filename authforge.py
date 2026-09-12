@@ -80,6 +80,21 @@ OFFLINE_LICENSE_ERRORS = (
     "hwid_mismatch",
 )
 
+# Activation requests (`.authforge-request`): unsigned transport for a HWID.
+# Distinct markers from BEGIN AUTHFORGE LICENSE. Not signed; the Checksum
+# header is the only integrity check. Keep _SDK_TAG in sync with pyproject.toml.
+_ACTIVATION_REQUEST_VERSION = 1
+_ACTIVATION_REQUEST_TYP = "authforge-activation-request"
+_BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----"
+_END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----"
+_SDK_TAG = "python/1.2.1"
+_ARMOR_LINE_WIDTH = 64
+_MAX_REQUEST_HWID = 256
+_MAX_REQUEST_MACHINE_NAME = 128
+_MAX_REQUEST_OS = 64
+_MAX_REQUEST_SDK = 64
+_MAX_REQUEST_LICENSE_KEY = 64
+
 
 class OfflineLicense(TypedDict):
     app_id: str
@@ -115,6 +130,131 @@ class ParsedLicenseFile(TypedDict):
     headers: Dict[str, str]
     payload_base64: str
     signature_base64: str
+
+
+def _clip_request_field(value: str, max_len: int) -> str:
+    return value if len(value) <= max_len else value[:max_len]
+
+
+def _json_escape_request(value: str) -> str:
+    out: List[str] = []
+    for ch in value:
+        code = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\b":
+            out.append("\\b")
+        elif ch == "\f":
+            out.append("\\f")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif code < 0x20:
+            out.append(f"\\u00{code:02x}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _wrap_armor_64(value: str) -> str:
+    return "\n".join(value[i : i + _ARMOR_LINE_WIDTH] for i in range(0, len(value), _ARMOR_LINE_WIDTH))
+
+
+def _canonical_activation_request_json(
+    *,
+    app_id: str,
+    hwid: str,
+    created_at: str,
+    machine_name: Optional[str] = None,
+    os_name: Optional[str] = None,
+    sdk: Optional[str] = None,
+    license_key: Optional[str] = None,
+) -> str:
+    parts = [
+        f'"v":{_ACTIVATION_REQUEST_VERSION}',
+        f'"typ":{_json_escape_request(_ACTIVATION_REQUEST_TYP)}',
+        f'"appId":{_json_escape_request(app_id)}',
+        f'"hwid":{_json_escape_request(_clip_request_field(hwid, _MAX_REQUEST_HWID))}',
+        f'"createdAt":{_json_escape_request(created_at)}',
+    ]
+    if machine_name:
+        parts.append(
+            f'"machineName":{_json_escape_request(_clip_request_field(machine_name, _MAX_REQUEST_MACHINE_NAME))}'
+        )
+    if os_name:
+        parts.append(f'"os":{_json_escape_request(_clip_request_field(os_name, _MAX_REQUEST_OS))}')
+    if sdk:
+        parts.append(f'"sdk":{_json_escape_request(_clip_request_field(sdk, _MAX_REQUEST_SDK))}')
+    if license_key:
+        parts.append(
+            f'"licenseKey":{_json_escape_request(_clip_request_field(license_key, _MAX_REQUEST_LICENSE_KEY))}'
+        )
+    return "{" + ",".join(parts) + "}"
+
+
+def _utc_iso_ms(value: Optional[datetime] = None) -> str:
+    now = value or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(now.microsecond / 1000):03d}Z"
+
+
+def _detect_os_label() -> str:
+    system = platform.system()
+    release = platform.release()
+    if system == "Darwin":
+        mac = platform.mac_ver()[0]
+        label = f"macOS {mac or release}"
+    elif system == "Windows":
+        label = f"Windows {release}"
+    elif system == "Linux":
+        label = f"Linux {release}"
+    else:
+        label = f"{system} {release}".strip()
+    return _clip_request_field(label, _MAX_REQUEST_OS)
+
+
+def format_activation_request(
+    *,
+    app_id: str,
+    hwid: str,
+    created_at: str,
+    machine_name: Optional[str] = None,
+    os: Optional[str] = None,
+    sdk: Optional[str] = None,
+    license_key: Optional[str] = None,
+) -> str:
+    """Armored ``.authforge-request`` text from explicit fields."""
+    json_body = _canonical_activation_request_json(
+        app_id=app_id,
+        hwid=hwid,
+        created_at=created_at,
+        machine_name=machine_name,
+        os_name=os,
+        sdk=sdk,
+        license_key=license_key,
+    )
+    payload_b64 = base64.b64encode(json_body.encode("utf-8")).decode("ascii")
+    checksum = hashlib.sha256(payload_b64.encode("utf-8")).hexdigest()[:16]
+    clean_app = app_id.replace("\r", " ").replace("\n", " ").strip()
+    return "\n".join(
+        [
+            _BEGIN_ACTIVATION_REQUEST,
+            f"Version: {_ACTIVATION_REQUEST_VERSION}",
+            f"App-Id: {clean_app}",
+            f"Checksum: {checksum}",
+            "",
+            _wrap_armor_64(payload_b64),
+            _END_ACTIVATION_REQUEST,
+            "",
+        ]
+    )
 
 
 def parse_license_file(text: str) -> Optional[ParsedLicenseFile]:
@@ -462,6 +602,49 @@ class AuthForgeClient:
         an offline ``.authforge`` file can be bound to it.
         """
         return self._hwid
+
+    def create_activation_request(
+        self,
+        *,
+        include_machine_name: bool = False,
+        machine_name: Optional[str] = None,
+        os: Optional[str] = None,
+        omit_os: bool = False,
+        sdk: Optional[str] = None,
+        omit_sdk: bool = False,
+        license_key: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> str:
+        """Build an activation request (``.authforge-request``) for this machine.
+
+        No network, no session, no app secret. The HWID is the same value
+        :meth:`login` / :meth:`login_from_file` use. ``machine_name`` is omitted
+        unless ``include_machine_name`` is true (hostnames are often a person's
+        name).
+        """
+        created = created_at if created_at else _utc_iso_ms()
+        name: Optional[str] = None
+        if include_machine_name:
+            name = machine_name or platform.node() or socket.gethostname()
+        os_name: Optional[str] = None if omit_os else (os if os is not None else _detect_os_label())
+        sdk_tag: Optional[str] = None if omit_sdk else (sdk if sdk is not None else _SDK_TAG)
+        key = license_key if license_key is not None else self._license_key
+        return format_activation_request(
+            app_id=self.app_id,
+            hwid=self._hwid,
+            created_at=created,
+            machine_name=name,
+            os=os_name,
+            sdk=sdk_tag,
+            license_key=key,
+        )
+
+    def write_activation_request(self, path: str, **kwargs: Any) -> None:
+        """Write an activation request to ``path`` (UTF-8). Same kwargs as
+        :meth:`create_activation_request`."""
+        text = self.create_activation_request(**kwargs)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
 
     def login_from_file(self, path_or_text: str) -> bool:
         """Authorize from a cloud-minted offline license file (``.authforge``)

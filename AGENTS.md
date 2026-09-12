@@ -7,7 +7,7 @@
 
 AuthForge is a license key validation service. Your app activates by sending a license key + hardware ID to `POST /auth/validate`; the server checks revocation, expiry, HWID binding, and credits, then returns an Ed25519-signed session with a TTL. By default the app then runs through the **grace period**: it keeps running on the signed session with no network calls, and a background check fails when the session TTL expires. Optionally, enable **online check-ins** (`online_heartbeat=True`): periodic `POST /auth/heartbeat` calls for fast revocation and concurrent-use detection. If the license is revoked or expired, the check-in fails and you handle it (typically exit the app).
 
-There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `login_from_file()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (`app_secret=None`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period.
+There is also a **separate** mode for machines that can never reach the internet: **offline license files (`.authforge`)**. The operator mints a signed file in the AuthForge cloud; `login_from_file()` verifies it locally with the app public key and the machine HWID, with zero network calls. Do not ship the App Secret in those builds (`app_secret=None`). Only use it when the user explicitly asks for air-gapped / offline-file licensing. The default integration is always online `login()` + grace period. To collect the HWID for a bound file, write an **activation request** (`.authforge-request`) with `create_activation_request` / `write_activation_request`. It is not a license, is not signed, and does not mint anything. Prefer it over printing the raw HWID.
 
 ## Billing model (so you can pick sensible intervals)
 
@@ -97,6 +97,8 @@ The attribute `client.heartbeat_mode` still exists for back-compat and reflects 
 | `get_offline_license()` | `dict \| None` | `jti`, `expires_at`, `hwid_policy`, … of the offline file in use |
 | `get_session_kind()` | `"online" \| "offline" \| None` | Kind of session the client holds; `None` when logged out |
 | `get_hwid()` | `str` | HWID this client sends; the customer reports it so the operator can mint a bound file |
+| `create_activation_request(**kwargs)` | `str` | Unsigned `.authforge-request` for this machine. No network, no secret, callable before `login()`. Hostname omitted unless `include_machine_name=True` |
+| `write_activation_request(path, **kwargs)` | `None` | Writes that file as UTF-8 |
 | `logout()` | `None` | Stops background checks and clears session state |
 | `is_authenticated()` | `bool` | Whether a session token is present and marked authenticated |
 | `get_session_data()` | `dict \| None` | Decoded signed payload map |

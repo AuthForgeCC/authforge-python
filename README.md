@@ -151,8 +151,8 @@ client = AuthForgeClient(
     on_failure=lambda reason, exc: print(reason, exc),
 )
 
-# 1. The customer sends you this value so you can bind the file to their machine:
-print("HWID:", client.get_hwid())
+# 1. Write an activation request the operator drops into the mint dialog:
+client.write_activation_request("machine.authforge-request")
 
 # 2. Later, authorize from the minted file (path or armored text). No network.
 if client.login_from_file("license.authforge"):
@@ -204,6 +204,8 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 | `get_offline_license()` | `dict \| None` | Metadata of the offline file in use (`jti`, `expires_at`, `hwid_policy`, …) |
 | `get_session_kind()` | `"online" \| "offline" \| None` | Which kind of session the client holds (`None` when logged out) |
 | `get_hwid()` | `str` | The HWID this client sends (or `hwid_override`); customers share it to receive a bound file |
+| `create_activation_request(**kwargs)` | `str` | Unsigned `.authforge-request` for this machine. No network, no secret. Hostname omitted unless `include_machine_name=True` |
+| `write_activation_request(path, **kwargs)` | `None` | Writes that file as UTF-8 |
 | `logout()` | `None` | Stops background checks and clears all session/auth state |
 | `is_authenticated()` | `bool` | True when an active authenticated session exists |
 | `get_session_data()` | `dict \| None` | Full decoded payload map |
