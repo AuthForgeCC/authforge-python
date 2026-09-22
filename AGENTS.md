@@ -23,6 +23,7 @@ Prefer **`pip install authforge-sdk`** from [PyPI](https://pypi.org/project/auth
 ## Minimal working integration
 
 ```python
+import os
 import sys
 from typing import Optional
 
@@ -33,7 +34,8 @@ def on_failure(reason: str, exc: Optional[Exception]) -> None:
     print(f"AuthForge: {reason}", file=sys.stderr)
     if exc is not None:
         print(exc, file=sys.stderr)
-    sys.exit(1)
+    # on_failure can run on the heartbeat thread, where sys.exit() only ends that thread.
+    os._exit(1)
 
 
 def main() -> None:
@@ -107,12 +109,20 @@ The attribute `client.heartbeat_mode` still exists for back-compat and reflects 
 
 ## Error codes the server can return
 
-Full set (`KNOWN_SERVER_ERRORS`): invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, system_error
+Full set (`KNOWN_SERVER_ERRORS`): invalid_app, invalid_key, expired, revoked, hwid_mismatch, no_credits, app_burn_cap_reached, blocked, rate_limited, replay_detected, app_disabled, session_expired, revoke_requires_session, bad_request, malformed_request, demo_quota_exceeded, system_error. Unrecognized codes are passed through verbatim.
 
 Notes:
 - `replay_detected` is validate-only. `rate_limited` can be returned by `/auth/validate` and `/auth/heartbeat` (heartbeat is license-limited at 6/min and has no app-layer IP limit).
+- `/auth/heartbeat` returns `hwid_mismatch` when the HWID is no longer bound to the license (for example after an HWID reset) and `blocked` when the HWID/IP is blacklisted or not whitelisted.
 - `app_burn_cap_reached` means the app's configured credit burn cap is hit; `revoke_requires_session` means a pre-session self-ban tried to revoke a license (only session-authenticated self-ban can revoke).
 - `session_expired` is also raised locally when the grace period (session TTL) runs out.
+
+Heartbeat failure classification (`AuthForgeError.transient` / `is_transient_error()`):
+- **Fatal** (`DEFINITIVE_ERROR_CODES`, the only allowlist): `revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch`. The SDK clears the stored session (as `logout()`) and stops check-ins before calling `on_failure`.
+- **Transient**: everything else, including `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, every `http_error_<status>`, `unexpected_response` and unknown codes. The session is kept and the SDK checks in again next interval; after the session TTL passes, the next transient failure becomes a fatal `session_expired`.
+- A failed check-in is a verdict only if the body is a JSON object with `"status": "failed"` and a non-empty string `error`; any other failure body becomes `unexpected_response` (message includes the raw `status`/`error`).
+- `rate_limited` (or a 429 with no code) is retried after 2s then 5s; the 429 codes `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached` are not retried immediately.
+- `on_failure` runs on the heartbeat thread with no SDK lock held: calling `logout()`, `is_authenticated()` or `login()` from it is safe. An in-flight check-in never restores a session after `logout()`/`login()`.
 
 ## Common patterns
 
@@ -149,18 +159,22 @@ Offline file error codes (in check order): `bad_armor`, `bad_signature`, `unsupp
 
 ### Custom error handling
 
-Server error codes appear as `ValueError` in the `exc` passed to `on_failure` from failed validation (e.g. `invalid_key`). Reasons are `login_failed`, `heartbeat_failed`, or `network_error`.
+Server error codes appear as `AuthForgeError` (a `ValueError` subclass) in the `exc` passed to `on_failure`: `exc.code` is the code (e.g. `invalid_key`, `revoked`, `hwid_mismatch`), `str(exc)` the message. Reasons are `login_failed`, `heartbeat_failed`, `network_error` (login only), or `offline_login_failed`. For `heartbeat_failed`, `exc` is always an `AuthForgeError`; use `exc.transient` to tolerate outages.
 
 ```python
+import os
 import sys
 from typing import Optional
 
+from authforge import AuthForgeError
+
 def on_failure(reason: str, exc: Optional[Exception]) -> None:
-    if isinstance(exc, ValueError) and exc.args:
-        code = str(exc.args[0])
-        if code in {"invalid_key", "expired", "revoked"}:
-            print(f"License issue: {code}", file=sys.stderr)
-    sys.exit(1)
+    if reason == "heartbeat_failed" and isinstance(exc, AuthForgeError) and exc.transient:
+        return  # network / rate_limited / no_credits / unexpected_response: SDK retries next interval
+    code = exc.code if isinstance(exc, AuthForgeError) else exc
+    if code in {"invalid_key", "expired", "revoked", "hwid_mismatch", "blocked"}:
+        print(f"License issue: {code}", file=sys.stderr)
+    os._exit(1)  # sys.exit() on the heartbeat thread would only end that thread
 ```
 
 ## Do NOT
@@ -168,6 +182,7 @@ def on_failure(reason: str, exc: Optional[Exception]) -> None:
 - Do not hardcode the app secret as a plain string literal in source: use environment variables or encrypted config
 - Do not embed the App Secret in air-gapped / `login_from_file` builds: pass `None` or `""`; verification only needs app id + public key
 - Do not skip the `on_failure` callback: without it, background check failures terminate the process via `os._exit(1)` without your cleanup
+- Do not treat every `heartbeat_failed` as a network blip or every one as fatal: check `exc.transient`. Fatal failures have already cleared the session, so do not keep the app running on it
 - Do not call `login()` on every app action: call it once at startup; the grace period (or online check-ins) handles the rest
 - Do not pass `heartbeat_mode` in new code: it is deprecated. Use the default grace period, or `online_heartbeat=True` when you need fast revocation or concurrent-use detection
 - Do not treat the grace period as persistent offline licensing: it is session continuation after one successful online activation, and revocations are only picked up at the next online validate or check-in

@@ -125,7 +125,7 @@ first (primary) entry.
 
 **Grace period (default).** After a successful activation, the SDK re-verifies the cached signed session payload and checks the expiry timestamp locally at each `heartbeat_interval`: no network calls. When the session TTL expires, it triggers failure with `session_expired`. The grace period is **session continuation within the session TTL** (default 24h, server clamps 1h to 7d) after one successful online activation. It is not persistent offline licensing, and a mid-session revocation is not picked up until the next online validate or check-in.
 
-**Online check-ins (opt-in, `online_heartbeat=True`).** The SDK calls `/auth/heartbeat` every `heartbeat_interval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state. Use this when you need fast revocation propagation or concurrent-use detection.
+**Online check-ins (opt-in, `online_heartbeat=True`).** The SDK calls `/auth/heartbeat` every `heartbeat_interval` seconds with a fresh nonce, verifies signature + nonce, and triggers failure on invalid session state. Use this when you need fast revocation propagation or concurrent-use detection. A definitive rejection (`revoked`, `hwid_mismatch`, `blocked`, ...) clears the stored session immediately; every other failure (network, `rate_limited`, `system_error`, `no_credits`, unrecognized responses, ...) is transient and keeps it until the session TTL runs out. See [Background check failures](#background-check-failures).
 
 Tune `ttl_seconds` to set the grace period duration (server default 24h, clamped to 1h to 7d).
 
@@ -219,25 +219,57 @@ If authentication fails (activation rejected, check-in fails, signature mismatch
 **`validate_license()`** does not trigger `on_failure` or `os._exit`: check `result["valid"]` and `result["code"]`.
 
 Recognized server errors (`KNOWN_SERVER_ERRORS`):
-`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `system_error`
+`invalid_app`, `invalid_key`, `expired`, `revoked`, `hwid_mismatch`, `no_credits`, `app_burn_cap_reached`, `blocked`, `rate_limited`, `replay_detected`, `app_disabled`, `session_expired`, `revoke_requires_session`, `bad_request`, `malformed_request`, `demo_quota_exceeded`, `system_error`. Codes added to the server later are passed through unchanged.
 
 Request retries are automatic inside the internal HTTP layer:
-- `rate_limited`: retry after 2s, then 5s (max 3 attempts total)
+- `rate_limited`, or HTTP 429 with no error code: retry after 2s, then 5s (max 3 attempts total)
+- `no_credits`, `demo_quota_exceeded` and `app_burn_cap_reached` also arrive as HTTP 429 but are never retried immediately; online check-ins try again at the next interval
 - network failure: retry once after 2s
 - every retry regenerates a fresh nonce
 
+### Background check failures
+
+Background check failures reach `on_failure("heartbeat_failed", exc)`, where `exc` is an `AuthForgeError` (a `ValueError` subclass):
+
+- `exc.code`: the server's error code from the response body, whatever the HTTP status (`revoked`, `expired`, `hwid_mismatch`, `blocked`, `session_expired`, `rate_limited`, `no_credits`, `system_error`, `malformed_request`, ...), or an SDK code: `network_error`, `timeout`, `http_error_<status>` (non-JSON error body), `invalid_json_response`, `unexpected_response`, `signature_mismatch`, `nonce_mismatch`.
+- `exc.transient` / `exc.fatal`: the classification. `is_transient_error(code_or_exc)` is the same check as a function; `DEFINITIVE_ERROR_CODES` is the full list of fatal codes.
+
+A failed check-in only counts as an AuthForge verdict when the body is a JSON object with `"status": "failed"` and a non-empty `error` string. Any other failure body (for example a proxy's JSON, or `{"status": "revoked"}`) is reported as `unexpected_response`, whose message includes the raw `status` and `error`.
+
+| Kind | Codes | What the SDK does |
+|---|---|---|
+| Fatal | `revoked`, `expired`, `hwid_mismatch` (the HWID is no longer bound to the license, for example after an HWID reset), `blocked` (HWID/IP blacklisted or not whitelisted), `session_expired` (also raised locally when the grace period or session TTL runs out), `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` | Clears the stored session (as `logout()` does) and stops background checks **before** calling `on_failure`, so the grace period cannot keep the app running on it. `on_failure` may call `login()` again. |
+| Transient | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, every `http_error_<status>`, `invalid_json_response`, `unexpected_response`, `nonce_mismatch`, any unrecognized code | Keeps the session and checks in again on the next `heartbeat_interval`. Once the signed session's TTL has passed, the next transient failure is reported as a fatal `session_expired` instead. |
+
+Transient failures only keep checking in if `on_failure` returns normally. Without a callback, any failure still ends the process with `os._exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
+
+`on_failure` runs on the background heartbeat thread with no SDK lock held, so calling `logout()`, `is_authenticated()` or `login()` from it is safe. A check-in that is still in flight when you call `logout()` or `login()` is discarded: it cannot restore the old session or report a failure for it.
+
+To tolerate short outages but exit on a definitive answer:
+
 ```python
-def handle_auth_failure(reason, exception):
-    print(f"Auth failed: {reason}")
-    if exception:
-        print(f"Details: {exception}")
-    # Clean up and exit gracefully
-    sys.exit(1)
+import os
+import sys
+from authforge import AuthForgeClient, AuthForgeError
+
+def handle_auth_failure(reason, exc):
+    if reason == "heartbeat_failed" and isinstance(exc, AuthForgeError) and exc.transient:
+        # Connectivity problem or AuthForge overloaded: keep running. The SDK
+        # retries every heartbeat_interval and reports session_expired (fatal)
+        # once the ttl_seconds grace period is used up.
+        print(f"AuthForge check-in failed ({exc.code}), retrying", file=sys.stderr)
+        return
+    code = exc.code if isinstance(exc, AuthForgeError) else exc
+    print(f"License check failed: {reason} ({code})", file=sys.stderr)
+    # on_failure can run on the heartbeat thread, where sys.exit() only ends that thread.
+    os._exit(1)
 
 client = AuthForgeClient(
     app_id="YOUR_APP_ID",
     app_secret="YOUR_APP_SECRET",
     public_key="YOUR_PUBLIC_KEY",
+    online_heartbeat=True,
+    ttl_seconds=3600,  # retry window for transient check-in failures
     on_failure=handle_auth_failure,
 )
 ```

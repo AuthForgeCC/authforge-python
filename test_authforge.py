@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
+import socket
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -272,6 +277,501 @@ class LoginFlowTests(unittest.TestCase):
             side_effect=AssertionError("grace period check must not use the network"),
         ):
             client._grace_period_check()
+
+
+def _urlopen_ok(body: dict) -> MagicMock:
+    resp = MagicMock()
+    resp.status = 200
+    resp.read.return_value = json.dumps(body).encode("utf-8")
+    cm = MagicMock()
+    cm.__enter__.return_value = resp
+    cm.__exit__.return_value = None
+    return cm
+
+
+def _http_error(status: int, raw: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://auth.test/auth/heartbeat", status, "err", {}, io.BytesIO(raw))
+
+
+def _failed_response(status: int, code: str):
+    """urlopen side effect: every call fails with a fresh HTTPError."""
+    return _http_error_response(status, json.dumps({"status": "failed", "error": code}).encode("utf-8"))
+
+
+def _http_error_response(status: int, raw: bytes):
+    def side_effect(*_args, **_kwargs):
+        raise _http_error(status, raw)
+
+    return side_effect
+
+
+def _ok_response(raw: bytes):
+    """urlopen side effect: every call returns HTTP 200 with ``raw``."""
+
+    def side_effect(*_args, **_kwargs):
+        resp = MagicMock()
+        resp.status = 200
+        resp.read.return_value = raw
+        cm = MagicMock()
+        cm.__enter__.return_value = resp
+        cm.__exit__.return_value = None
+        return cm
+
+    return side_effect
+
+
+def _run_in_thread(target) -> None:
+    """Run ``target`` on a worker thread; fail instead of hanging on a deadlock."""
+    errors: list = []
+
+    def run() -> None:
+        try:
+            target()
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(5)
+    if worker.is_alive():
+        raise AssertionError("heartbeat tick deadlocked")
+    if errors:
+        raise errors[0]
+
+
+class HeartbeatFailureTests(unittest.TestCase):
+    """Every /auth/heartbeat failure reaches on_failure with its code and
+    classification; definitive failures drop the stored session."""
+
+    DEFINITIVE = [
+        ("revoked", 410),
+        ("expired", 410),
+        ("hwid_mismatch", 403),
+        ("blocked", 403),
+        ("app_disabled", 403),
+        ("session_expired", 401),
+        ("invalid_app", 401),
+        ("malformed_request", 400),
+    ]
+    TRANSIENT = [
+        ("rate_limited", 429),
+        ("system_error", 500),
+        ("server_error", 500),
+        ("no_credits", 429),
+        ("demo_quota_exceeded", 429),
+        ("app_burn_cap_reached", 429),
+        ("bad_request", 400),
+        ("invalid_key", 401),
+        ("some_future_code", 400),
+    ]
+    NOT_RETRIED_429 = ("no_credits", "demo_quota_exceeded", "app_burn_cap_reached")
+
+    def setUp(self) -> None:
+        self.vectors = _load_test_vectors()
+        sleep_patch = patch("authforge.time.sleep")
+        self.sleep = sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
+        self._fresh_client()
+
+    def _fresh_client(self) -> None:
+        self.sleep.reset_mock()
+        self.failures: list = []
+        self.client = AuthForgeClient(
+            "app-id",
+            "app-secret",
+            self.vectors["publicKey"],
+            heartbeat_interval=86400,
+            online_heartbeat=True,
+            on_failure=lambda reason, exc: self.failures.append((reason, exc)),
+        )
+        validate = next(c for c in self.vectors["cases"] if c["id"] == "validate_success")
+        c = self.client
+        c._license_key = "license-key"
+        c._session_token = "session.validate.token"
+        c._session_kind = "online"
+        c._session_expires_in = int(time.time()) + 3600
+        c._raw_payload_b64 = validate["payload"]
+        c._signature = validate["signature"]
+        c._session_data = {"tier": "pro"}
+        c._authenticated = True
+
+    def _tick(self, urlopen_side_effect) -> bool:
+        with patch("authforge.urllib.request.urlopen", side_effect=urlopen_side_effect) as urlopen:
+            keep_running = self.client._heartbeat_tick()
+        self.urlopen_calls = urlopen.call_count
+        return keep_running
+
+    def _only_failure(self) -> authforge.AuthForgeError:
+        self.assertEqual(len(self.failures), 1, self.failures)
+        reason, exc = self.failures[0]
+        self.assertEqual(reason, "heartbeat_failed")
+        self.assertIsInstance(exc, authforge.AuthForgeError)
+        self.assertIsInstance(exc, ValueError)
+        return exc
+
+    def _assert_invalidated(self) -> None:
+        self.assertFalse(self.client.is_authenticated())
+        self.assertIsNone(self.client.get_session_kind())
+        self.assertIsNone(self.client.get_session_data())
+        self.assertIsNone(self.client._raw_payload_b64)
+        self.assertFalse(self.client._heartbeat_started)
+        self.assertTrue(self.client._heartbeat_stop.is_set())
+        with self.assertRaises(RuntimeError):
+            self.client._grace_period_check()
+
+    def _assert_session_kept(self) -> None:
+        self.assertTrue(self.client.is_authenticated())
+        self.assertEqual(self.client._session_token, "session.validate.token")
+        self.assertFalse(self.client._heartbeat_stop.is_set())
+
+    def _assert_definitive(self, code: str) -> None:
+        exc = self._only_failure()
+        self.assertEqual(exc.code, code)
+        self.assertEqual(str(exc), code)
+        self.assertTrue(exc.fatal)
+        self.assertFalse(exc.transient)
+        self.assertFalse(authforge.is_transient_error(exc))
+        self.assertEqual(self.urlopen_calls, 1, "definitive codes are not retried")
+        self.sleep.assert_not_called()
+        self._assert_invalidated()
+
+    def _assert_transient(self, code: str) -> authforge.AuthForgeError:
+        exc = self._only_failure()
+        self.assertEqual(exc.code, code)
+        self.assertTrue(exc.transient)
+        self.assertFalse(exc.fatal)
+        self._assert_session_kept()
+        return exc
+
+    def test_definitive_codes_from_non_2xx_invalidate_session(self) -> None:
+        for code, status in self.DEFINITIVE:
+            with self.subTest(code=code, status=status):
+                self._fresh_client()
+                self.assertFalse(self._tick(_failed_response(status, code)))
+                self._assert_definitive(code)
+
+    def test_definitive_codes_in_200_body_invalidate_session(self) -> None:
+        for code, _status in self.DEFINITIVE:
+            with self.subTest(code=code):
+                self._fresh_client()
+                body = json.dumps({"status": "failed", "error": code}).encode("utf-8")
+                self.assertFalse(self._tick(_ok_response(body)))
+                self._assert_definitive(code)
+
+    def test_verdict_status_and_code_are_normalized(self) -> None:
+        body = json.dumps({"status": " FAILED ", "error": " Revoked "}).encode("utf-8")
+        self.assertFalse(self._tick(_ok_response(body)))
+        self._assert_definitive("revoked")
+
+    def test_tampered_signature_is_definitive(self) -> None:
+        heartbeat = next(c for c in self.vectors["cases"] if c["id"] == "heartbeat_success")
+        forged = json.loads(base64.b64decode(heartbeat["payload"]))
+        forged["sessionToken"] = "session.forged.token"
+        wrong_key = next(c for c in self.vectors["cases"] if c["id"] == "wrong_app_key")
+        cases = [
+            ("tampered", base64.b64encode(json.dumps(forged).encode("utf-8")).decode("ascii"),
+             heartbeat["signature"], "nonce-heartbeat-001"),
+            ("wrong_app_key", wrong_key["payload"], wrong_key["signature"], "nonce-validate-001"),
+        ]
+        for label, payload, signature, nonce in cases:
+            with self.subTest(case=label):
+                self._fresh_client()
+                body = json.dumps({"status": "ok", "payload": payload, "signature": signature}).encode("utf-8")
+                with patch.object(AuthForgeClient, "_generate_nonce", return_value=nonce):
+                    self.assertFalse(self._tick(_ok_response(body)))
+                self._assert_definitive("signature_mismatch")
+
+    def test_transient_codes_keep_session_and_loop(self) -> None:
+        for code, status in self.TRANSIENT:
+            for label, side_effect in (
+                ("non-2xx", _failed_response(status, code)),
+                ("200 body", _ok_response(json.dumps({"status": "failed", "error": code}).encode("utf-8"))),
+            ):
+                with self.subTest(code=code, response=label):
+                    self._fresh_client()
+                    self.assertTrue(self._tick(side_effect))
+                    exc = self._assert_transient(code)
+                    self.assertEqual(str(exc), code)
+
+    def test_rate_limited_is_retried_before_reporting(self) -> None:
+        self.assertTrue(self._tick(_failed_response(429, "rate_limited")))
+        self.assertEqual(self.urlopen_calls, 3)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2, 5])
+        self._assert_transient("rate_limited")
+
+    def test_bare_429_is_retried_as_rate_limit(self) -> None:
+        self.assertTrue(self._tick(_http_error_response(429, b'{"status":"failed"}')))
+        self.assertEqual(self.urlopen_calls, 3)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2, 5])
+        self._assert_transient("unexpected_response")
+
+    def test_credit_429s_are_not_retried(self) -> None:
+        for code in self.NOT_RETRIED_429:
+            with self.subTest(code=code):
+                self._fresh_client()
+                self.assertTrue(self._tick(_failed_response(429, code)))
+                self.assertEqual(self.urlopen_calls, 1)
+                self.sleep.assert_not_called()
+                self._assert_transient(code)
+
+    def test_non_json_error_responses_are_transient(self) -> None:
+        for status in (403, 500, 502):
+            with self.subTest(status=status):
+                self._fresh_client()
+                self.assertTrue(self._tick(_http_error_response(status, b"<html>error</html>")))
+                self.assertEqual(self.urlopen_calls, 1)
+                self._assert_transient(f"http_error_{status}")
+
+    def test_unparseable_200_bodies_are_transient(self) -> None:
+        cases = [
+            (b"", "invalid_json_response"),
+            (b"<html>ok</html>", "invalid_json_response"),
+            (b'["failed","revoked"]', "response_not_json_object"),
+            (b'"revoked"', "response_not_json_object"),
+        ]
+        for raw, code in cases:
+            with self.subTest(raw=raw):
+                self._fresh_client()
+                self.assertTrue(self._tick(_ok_response(raw)))
+                self._assert_transient(code)
+
+    def test_malformed_failure_bodies_are_unexpected_response(self) -> None:
+        bodies = [
+            {"error": "revoked"},
+            {"status": "revoked"},
+            {"status": "failed"},
+            {"status": "failed", "error": ""},
+            {"status": "failed", "error": 7},
+            {"status": "denied", "error": "revoked"},
+        ]
+        for body in bodies:
+            for label, side_effect in (
+                ("200", _ok_response(json.dumps(body).encode("utf-8"))),
+                ("403", _http_error_response(403, json.dumps(body).encode("utf-8"))),
+            ):
+                with self.subTest(body=body, response=label):
+                    self._fresh_client()
+                    self.assertTrue(self._tick(side_effect))
+                    exc = self._assert_transient("unexpected_response")
+                    self.assertIn(f"status={body.get('status')!r}", str(exc))
+                    self.assertIn(f"error={body.get('error')!r}", str(exc))
+
+    def test_network_error_is_transient_and_reported_once(self) -> None:
+        self.assertTrue(self._tick(urllib.error.URLError("connection refused")))
+        self.assertEqual(self.urlopen_calls, 2)
+        exc = self._assert_transient("network_error")
+        self.assertTrue(str(exc).startswith("url_error: "))
+
+    def test_timeout_is_transient_and_reported_once(self) -> None:
+        self.assertTrue(self._tick(socket.timeout("timed out")))
+        self.assertEqual(self.urlopen_calls, 2)
+        self._assert_transient("timeout")
+
+    def test_transient_failure_after_session_ttl_becomes_fatal(self) -> None:
+        for cause, side_effect in (
+            ("network_error", urllib.error.URLError("offline")),
+            ("no_credits", _failed_response(429, "no_credits")),
+            ("unexpected_response", _ok_response(b'{"status":"revoked"}')),
+        ):
+            with self.subTest(cause=cause):
+                self._fresh_client()
+                self.client._session_expires_in = int(time.time()) - 1
+                self.assertFalse(self._tick(side_effect))
+                exc = self._only_failure()
+                self.assertEqual(exc.code, "session_expired")
+                self.assertTrue(exc.fatal)
+                self.assertEqual(exc.__cause__.code, cause)
+                self._assert_invalidated()
+
+    def test_success_after_transient_failure_refreshes_session(self) -> None:
+        heartbeat = next(c for c in self.vectors["cases"] if c["id"] == "heartbeat_success")
+        with patch.object(AuthForgeClient, "_generate_nonce", return_value="nonce-heartbeat-001"):
+            self.assertTrue(self._tick(urllib.error.URLError("offline")))
+            self.assertTrue(
+                self._tick(
+                    [_urlopen_ok({"status": "ok", "payload": heartbeat["payload"], "signature": heartbeat["signature"]})]
+                )
+            )
+        self.assertEqual(len(self.failures), 1)
+        self.assertTrue(self.client.is_authenticated())
+        self.assertEqual(self.client._session_token, "session.heartbeat.token")
+
+    def test_session_is_dropped_before_on_failure_runs(self) -> None:
+        seen = MagicMock()
+        self.client.on_failure = lambda reason, exc: seen(self.client.is_authenticated())
+        self._tick(_failed_response(410, "revoked"))
+        seen.assert_called_once_with(False)
+
+    def test_grace_period_expiry_invalidates_session(self) -> None:
+        self.client.online_heartbeat = False
+        self.client._session_expires_in = int(time.time()) - 1
+        self.assertFalse(self._tick(AssertionError("grace period must not use the network")))
+        exc = self._only_failure()
+        self.assertEqual(exc.code, "session_expired")
+        self.assertTrue(exc.fatal)
+        self._assert_invalidated()
+
+    def test_without_on_failure_any_failure_exits(self) -> None:
+        self.client.on_failure = None
+        with patch("authforge.os._exit") as exit_mock:
+            self._tick(urllib.error.URLError("offline"))
+        exit_mock.assert_called_once_with(1)
+
+    def test_is_transient_error_classification(self) -> None:
+        definitive = {
+            "revoked",
+            "expired",
+            "hwid_mismatch",
+            "blocked",
+            "session_expired",
+            "malformed_request",
+            "app_disabled",
+            "invalid_app",
+            "signature_mismatch",
+        }
+        self.assertEqual(authforge.DEFINITIVE_ERROR_CODES, definitive)
+        self.assertEqual(authforge.TRANSIENT_ERROR_CODES & definitive, frozenset())
+        for code in definitive:
+            self.assertFalse(authforge.is_transient_error(code), code)
+            self.assertTrue(authforge.AuthForgeError(code).fatal, code)
+        for code in (
+            *authforge.TRANSIENT_ERROR_CODES,
+            "server_error",
+            "http_error_400",
+            "http_error_403",
+            "http_error_404",
+            "http_error_429",
+            "http_error_503",
+            "some_future_code",
+            "",
+            None,
+        ):
+            self.assertTrue(authforge.is_transient_error(code), code)
+        self.assertFalse(authforge.is_transient_error(authforge.AuthForgeError("revoked")))
+        self.assertTrue(authforge.is_transient_error(authforge.AuthForgeError("no_credits")))
+        self.assertTrue(authforge.is_transient_error(RuntimeError("revoked")))
+
+    def test_on_failure_can_logout_and_query_state_without_deadlock(self) -> None:
+        for label, side_effect, fatal in (
+            ("transient", _failed_response(500, "system_error"), False),
+            ("fatal", _failed_response(410, "revoked"), True),
+        ):
+            with self.subTest(failure=label):
+                self._fresh_client()
+                seen: list = []
+
+                def on_failure(reason, exc):
+                    seen.append(("before", self.client.is_authenticated()))
+                    self.client.logout()
+                    seen.append(("after", self.client.is_authenticated()))
+
+                self.client.on_failure = on_failure
+                _run_in_thread(lambda: self._tick(side_effect))
+                self.assertEqual(seen, [("before", not fatal), ("after", False)])
+                self._assert_invalidated()
+
+    def test_logout_during_in_flight_heartbeat_stays_logged_out(self) -> None:
+        heartbeat = next(c for c in self.vectors["cases"] if c["id"] == "heartbeat_success")
+        success = _ok_response(
+            json.dumps(
+                {"status": "ok", "payload": heartbeat["payload"], "signature": heartbeat["signature"]}
+            ).encode("utf-8")
+        )
+        for label, response in (("success", success), ("revoked", _failed_response(410, "revoked"))):
+            with self.subTest(response=label):
+                self._fresh_client()
+                entered = threading.Event()
+                release = threading.Event()
+
+                def blocking_urlopen(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError("heartbeat was never released")
+                    return response(*args, **kwargs)
+
+                results: list = []
+
+                def tick() -> None:
+                    with patch.object(AuthForgeClient, "_generate_nonce", return_value="nonce-heartbeat-001"):
+                        results.append(self._tick(blocking_urlopen))
+
+                worker = threading.Thread(target=tick, daemon=True)
+                worker.start()
+                self.assertTrue(entered.wait(5))
+                self.client.logout()
+                release.set()
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(len(results), 1)
+                self.assertFalse(self.client.is_authenticated())
+                self.assertIsNone(self.client._session_token)
+                self.assertIsNone(self.client.get_session_kind())
+                self.assertEqual(self.failures, [], "a stale tick must not report")
+
+    def test_late_heartbeat_does_not_overwrite_a_new_login(self) -> None:
+        heartbeat = next(c for c in self.vectors["cases"] if c["id"] == "heartbeat_success")
+        validate = next(c for c in self.vectors["cases"] if c["id"] == "validate_success")
+        entered = threading.Event()
+        release = threading.Event()
+        success = _ok_response(
+            json.dumps(
+                {"status": "ok", "payload": heartbeat["payload"], "signature": heartbeat["signature"]}
+            ).encode("utf-8")
+        )
+
+        def blocking_urlopen(*args, **kwargs):
+            entered.set()
+            release.wait(5)
+            return success(*args, **kwargs)
+
+        def tick() -> None:
+            with patch.object(AuthForgeClient, "_generate_nonce", return_value="nonce-heartbeat-001"):
+                self._tick(blocking_urlopen)
+
+        worker = threading.Thread(target=tick, daemon=True)
+        worker.start()
+        self.assertTrue(entered.wait(5))
+        self.client._apply_signed_response(
+            {"status": "ok", "payload": validate["payload"], "signature": validate["signature"]},
+            expected_nonce="nonce-validate-001",
+            license_key="new-license-key",
+            context="validate",
+        )
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.client._license_key, "new-license-key")
+        self.assertEqual(self.client._session_token, "session.validate.token")
+
+    def test_loop_keeps_checking_in_after_transient_failures(self) -> None:
+        self.client.heartbeat_interval = 0
+
+        def on_failure(reason, exc):
+            self.failures.append((reason, exc))
+            if len(self.failures) == 3:
+                self.client.logout()
+
+        self.client.on_failure = on_failure
+        with patch("authforge.urllib.request.urlopen", side_effect=_failed_response(503, "system_error")):
+            self.client._start_heartbeat_once()
+            thread = self.client._heartbeat_thread
+            assert thread is not None
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([exc.code for _reason, exc in self.failures], ["system_error"] * 3)
+        self.assertFalse(self.client.is_authenticated())
+
+    def test_loop_stops_after_definitive_failure(self) -> None:
+        self.client.heartbeat_interval = 0
+        with patch("authforge.urllib.request.urlopen", side_effect=_failed_response(410, "revoked")) as urlopen:
+            self.client._start_heartbeat_once()
+            thread = self.client._heartbeat_thread
+            assert thread is not None
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual([exc.code for _reason, exc in self.failures], ["revoked"])
+        self._assert_invalidated()
 
 
 # ---------------------------------------------------------------------------

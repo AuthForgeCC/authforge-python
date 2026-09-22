@@ -87,7 +87,7 @@ _ACTIVATION_REQUEST_VERSION = 1
 _ACTIVATION_REQUEST_TYP = "authforge-activation-request"
 _BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----"
 _END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----"
-_SDK_TAG = "python/1.3.1"
+_SDK_TAG = "python/1.4.0"
 _ARMOR_LINE_WIDTH = 64
 _MAX_REQUEST_HWID = 256
 _MAX_REQUEST_MACHINE_NAME = 128
@@ -492,8 +492,88 @@ KNOWN_SERVER_ERRORS = {
     "revoke_requires_session",
     "bad_request",
     "malformed_request",
+    "demo_quota_exceeded",
     "system_error",
 }
+
+# Well-formed AuthForge verdicts that end the session. This is the only list
+# the classification uses: every other code is transient.
+DEFINITIVE_ERROR_CODES = frozenset(
+    {
+        "revoked",
+        "expired",
+        "hwid_mismatch",
+        "blocked",
+        "session_expired",
+        "malformed_request",
+        "app_disabled",
+        "invalid_app",
+        "signature_mismatch",
+    }
+)
+
+# Reference list of the named transient codes. Informational only: any code
+# outside DEFINITIVE_ERROR_CODES is transient, including every
+# http_error_<status>, unexpected_response and codes the server adds later.
+TRANSIENT_ERROR_CODES = frozenset(
+    {
+        "network_error",
+        "timeout",
+        "rate_limited",
+        "system_error",
+        "handler_error",
+        "invalid_json_response",
+        "response_not_json_object",
+        "unexpected_response",
+        "no_credits",
+        "demo_quota_exceeded",
+        "app_burn_cap_reached",
+        "bad_request",
+        "invalid_key",
+        "replay_detected",
+        "revoke_requires_session",
+        "missing_session_token",
+        "nonce_mismatch",
+        "unknown_error",
+    }
+)
+_SERVER_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+class AuthForgeError(ValueError):
+    """A failure with a machine-readable ``code``: the server's error code
+    (``revoked``, ``hwid_mismatch``, ...) or an SDK code (``network_error``,
+    ``timeout``, ``http_error_502``, ...). ``str(exc)`` is the human message,
+    which equals ``code`` for server errors."""
+
+    def __init__(self, code: str, message: Optional[str] = None) -> None:
+        super().__init__(message if message is not None else code)
+        self.code = code
+
+    @property
+    def transient(self) -> bool:
+        """True when retrying later can succeed (see :func:`is_transient_error`)."""
+        return is_transient_error(self.code)
+
+    @property
+    def fatal(self) -> bool:
+        """True when AuthForge definitively rejected the session or license."""
+        return not self.transient
+
+
+def is_transient_error(error: Union[str, BaseException, None]) -> bool:
+    """Classify a failure code (or an exception from ``on_failure``).
+
+    Definitive (fatal) only for the codes in :data:`DEFINITIVE_ERROR_CODES`.
+    Everything else is transient: network failures, ``rate_limited``,
+    ``no_credits``, ``http_error_<status>``, ``unexpected_response``, unknown
+    codes, ... ``None`` and exceptions other than :class:`AuthForgeError`
+    carry no AuthForge verdict and are transient too.
+    """
+    code = error.code if isinstance(error, AuthForgeError) else error
+    if not isinstance(code, str):
+        return True
+    return code not in DEFINITIVE_ERROR_CODES
 
 
 class AuthForgeClient:
@@ -573,6 +653,9 @@ class AuthForgeClient:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_started = False
         self._heartbeat_stop = threading.Event()
+        # Bumped whenever the stored session is replaced or cleared, so a
+        # heartbeat that started before logout()/login() can't write back.
+        self._session_generation = 0
 
         self._license_key: Optional[str] = None
         self._session_token: Optional[str] = None
@@ -880,31 +963,80 @@ class AuthForgeClient:
             # the file's own expires_at is the only clock. Never start a thread.
             if self._heartbeat_started or self._session_kind == "offline":
                 return
-            self._heartbeat_stop.clear()
+            # A fresh event per thread: logout() stops this loop even if a
+            # later login() starts another one before this one wakes up.
+            stop = threading.Event()
+            self._heartbeat_stop = stop
             self._heartbeat_started = True
             self._heartbeat_thread = threading.Thread(
                 target=self._heartbeat_loop,
+                args=(stop,),
                 name="AuthForgeHeartbeat",
                 daemon=True,
             )
             self._heartbeat_thread.start()
 
-    def _heartbeat_loop(self) -> None:
-        while not self._heartbeat_stop.wait(self.heartbeat_interval):
-            with self._lock:
-                offline = self._session_kind == "offline"
-            if offline:
-                return
-            try:
-                if self.online_heartbeat:
-                    self._server_heartbeat()
-                else:
-                    self._grace_period_check()
-            except Exception as exc:
-                self._fail("heartbeat_failed", exc)
+    def _heartbeat_loop(self, stop: Optional[threading.Event] = None) -> None:
+        stop = stop if stop is not None else self._heartbeat_stop
+        while not stop.wait(self.heartbeat_interval):
+            if not self._heartbeat_tick():
                 break
 
-    def _server_heartbeat(self) -> None:
+    def _heartbeat_tick(self) -> bool:
+        """Run one background check. Returns ``False`` when the loop must stop.
+
+        Transient failures are reported and the loop keeps checking in on the
+        next interval. Definitive failures drop the stored session first, so
+        neither the grace period nor ``is_authenticated()`` keeps the app
+        running on it, and ``on_failure`` may call ``login()`` again.
+        ``on_failure`` always runs with no SDK lock held.
+        """
+        with self._lock:
+            offline = self._session_kind == "offline"
+            generation = self._session_generation
+        if offline:
+            return False
+        try:
+            if self.online_heartbeat:
+                self._server_heartbeat(generation)
+            else:
+                self._grace_period_check()
+            return True
+        except Exception as exc:
+            error = self._heartbeat_error(exc)
+        with self._lock:
+            # The session this check ran for was logged out or replaced
+            # meanwhile: its failure is moot and must not touch the new state.
+            if generation != self._session_generation:
+                return True
+            if error.fatal:
+                self._clear_session_locked()
+        self._fail("heartbeat_failed", error)
+        return error.transient
+
+    def _heartbeat_error(self, exc: Exception) -> AuthForgeError:
+        if isinstance(exc, AuthForgeError):
+            error = exc
+        else:
+            message = str(exc)
+            code = message.split(":", 1)[0].strip().lower()
+            if not _SERVER_ERROR_CODE_RE.fullmatch(code):
+                code = "unknown_error"
+            error = AuthForgeError(code, message)
+            error.__cause__ = exc
+        # A transient failure can't extend the session past its signed TTL.
+        if error.transient and self._local_session_expired():
+            expired = AuthForgeError("session_expired")
+            expired.__cause__ = error
+            return expired
+        return error
+
+    def _local_session_expired(self) -> bool:
+        with self._lock:
+            expires_in = self._session_expires_in
+        return expires_in is not None and int(time.time()) >= int(expires_in)
+
+    def _server_heartbeat(self, generation: Optional[int] = None) -> None:
         with self._lock:
             session_token = self._session_token
             hwid = self._hwid
@@ -917,13 +1049,35 @@ class AuthForgeClient:
             "nonce": self._generate_nonce(),
             "hwid": hwid,
         }
-        response_obj = self._post_json("/auth/heartbeat", body)
+        # Network failures surface once, as heartbeat_failed / network_error.
+        response_obj = self._post_json("/auth/heartbeat", body, skip_failure_hook=True)
+        if not self._is_success_status(response_obj.get("status")):
+            raise self._heartbeat_verdict(response_obj)
         expected_nonce = str(body.get("nonce", "")).strip()
         self._apply_signed_response(
             response_obj,
             expected_nonce=expected_nonce,
             license_key=None,
             context="heartbeat",
+            generation=generation,
+        )
+
+    def _heartbeat_verdict(self, response_obj: Dict[str, Any]) -> AuthForgeError:
+        # Only {"status": "failed", "error": "<code>"} is an AuthForge verdict.
+        # Anything else (a proxy's JSON, a half-written body) must not be able
+        # to end the session with a definitive code.
+        status = response_obj.get("status")
+        error = response_obj.get("error")
+        if (
+            isinstance(status, str)
+            and status.strip().lower() == "failed"
+            and isinstance(error, str)
+            and error.strip()
+        ):
+            return AuthForgeError(self._extract_server_error(response_obj))
+        return AuthForgeError(
+            "unexpected_response",
+            f"unexpected_response: status={status!r} error={error!r}",
         )
 
     def _grace_period_check(self) -> None:
@@ -943,7 +1097,7 @@ class AuthForgeClient:
 
         now = int(time.time())
         if now >= int(expires_in):
-            raise RuntimeError("session_expired")
+            raise AuthForgeError("session_expired")
 
     def _validate_and_store(self, license_key: str) -> None:
         body: Dict[str, Any] = {
@@ -969,8 +1123,7 @@ class AuthForgeClient:
     ) -> Dict[str, Any]:
         status = response_obj.get("status")
         if not self._is_success_status(status):
-            error_code = self._extract_server_error(response_obj)
-            raise ValueError(error_code)
+            raise AuthForgeError(self._extract_server_error(response_obj))
 
         raw_payload_b64 = self._require_str(response_obj, "payload")
         signature = self._require_str(response_obj, "signature")
@@ -1037,12 +1190,16 @@ class AuthForgeClient:
         expected_nonce: str,
         license_key: Optional[str],
         context: str,
+        generation: Optional[int] = None,
     ) -> None:
         parsed = self._parse_validate_success(response_obj, expected_nonce)
         _ = context
 
         with self._lock:
+            if generation is not None and generation != self._session_generation:
+                return
             if license_key is not None:
+                self._session_generation += 1
                 self._license_key = license_key
             self._session_token = parsed["session_token"]
             self._session_kind = "online"
@@ -1089,7 +1246,7 @@ class AuthForgeClient:
                         detail = exc.read().decode("utf-8")
                         obj = self._parse_response_object(detail)
                     except Exception:
-                        raise RuntimeError(f"http_error_{status_code}") from exc
+                        raise AuthForgeError(f"http_error_{status_code}") from exc
                     data.clear()
                     data.update(body)
                     break
@@ -1100,11 +1257,15 @@ class AuthForgeClient:
                         continue
                     if not skip_failure_hook:
                         self._fail("network_error", exc)
-                    raise RuntimeError(f"url_error: {exc}") from exc
+                    reason = getattr(exc, "reason", exc)
+                    code = "timeout" if isinstance(reason, (socket.timeout, TimeoutError)) else "network_error"
+                    raise AuthForgeError(code, f"url_error: {exc}") from exc
 
-            is_rate_limited = (
-                status_code == 429
-                or self._extract_server_error(obj) == "rate_limited"
+            # no_credits / app_burn_cap_reached also use HTTP 429 but are not
+            # worth retrying; only retry a genuine rate limit.
+            server_error = self._extract_server_error(obj)
+            is_rate_limited = server_error == "rate_limited" or (
+                status_code == 429 and server_error == "unknown_error"
             )
             if is_rate_limited and rate_attempt < len(RATE_LIMIT_RETRY_DELAYS):
                 time.sleep(RATE_LIMIT_RETRY_DELAYS[rate_attempt])
@@ -1116,9 +1277,9 @@ class AuthForgeClient:
         try:
             obj = json.loads(raw_response)
         except json.JSONDecodeError as exc:
-            raise ValueError("invalid_json_response") from exc
+            raise AuthForgeError("invalid_json_response") from exc
         if not isinstance(obj, dict):
-            raise ValueError("response_not_json_object")
+            raise AuthForgeError("response_not_json_object")
         return obj
 
     def _get_hwid(self) -> str:
@@ -1298,8 +1459,11 @@ class AuthForgeClient:
         return text
 
     def _extract_server_error(self, obj: Dict[str, Any]) -> str:
-        raw_error = str(obj.get("error", "")).strip().lower()
-        if raw_error in KNOWN_SERVER_ERRORS:
+        # Pass through codes this SDK version doesn't know yet instead of
+        # collapsing them into unknown_error.
+        raw = obj.get("error")
+        raw_error = raw.strip().lower() if isinstance(raw, str) else ""
+        if raw_error in KNOWN_SERVER_ERRORS or _SERVER_ERROR_CODE_RE.fullmatch(raw_error):
             return raw_error
         status = str(obj.get("status", "")).strip().lower()
         if status in KNOWN_SERVER_ERRORS:
@@ -1321,23 +1485,29 @@ class AuthForgeClient:
         os._exit(1)
 
     def logout(self) -> None:
-        self._heartbeat_stop.set()
+        """Clear the session and stop background checks. Never joins the
+        heartbeat thread, so it is safe to call from ``on_failure``."""
         with self._lock:
-            self._license_key = None
-            self._session_token = None
-            self._session_kind = None
-            self._session_expires_in = None
-            self._last_nonce = None
-            self._raw_payload_b64 = None
-            self._signature = None
-            self._key_id = None
-            self._session_data = None
-            self._app_variables = None
-            self._license_variables = None
-            self._authenticated = False
-            self._offline_license = None
-            self._heartbeat_started = False
-            self._heartbeat_thread = None
+            self._clear_session_locked()
+
+    def _clear_session_locked(self) -> None:
+        self._heartbeat_stop.set()
+        self._session_generation += 1
+        self._license_key = None
+        self._session_token = None
+        self._session_kind = None
+        self._session_expires_in = None
+        self._last_nonce = None
+        self._raw_payload_b64 = None
+        self._signature = None
+        self._key_id = None
+        self._session_data = None
+        self._app_variables = None
+        self._license_variables = None
+        self._authenticated = False
+        self._offline_license = None
+        self._heartbeat_started = False
+        self._heartbeat_thread = None
 
     def is_authenticated(self) -> bool:
         """True for an online session (:meth:`login`) or an offline one
