@@ -214,7 +214,7 @@ A desktop app running 6h/day with online check-ins at a 15-minute interval burns
 
 ## Failure Handling
 
-If authentication fails (activation rejected, check-in fails, signature mismatch, grace period expired, etc.), the SDK calls your `on_failure` callback if one is provided. If no callback is set, **the SDK calls `os._exit(1)` to terminate the process.** This is intentional: it prevents your app from running without a valid license.
+If authentication fails (activation rejected, check-in fails, signature mismatch, grace period expired, etc.), the SDK calls your `on_failure` callback if one is provided. Without a callback, a transient background check failure (network outage, `rate_limited`, `system_error`, ...) writes a one-line warning to stderr and check-ins continue; every other failure (a rejected `login()`, a definitive check-in answer, the grace period running out) **calls `os._exit(1)` to terminate the process**, so your app cannot keep running without a valid license. `os._exit` skips all cleanup, so set `on_failure` if your app has anything to save.
 
 **`validate_license()`** does not trigger `on_failure` or `os._exit`: check `result["valid"]` and `result["code"]`.
 
@@ -241,16 +241,18 @@ A failed check-in only counts as an AuthForge verdict when the body is a JSON ob
 | Fatal | `revoked`, `expired`, `hwid_mismatch` (the HWID is no longer bound to the license, for example after an HWID reset), `blocked` (HWID/IP blacklisted or not whitelisted), `session_expired` (also raised locally when the grace period or session TTL runs out), `malformed_request`, `app_disabled`, `invalid_app`, `signature_mismatch` | Clears the stored session (as `logout()` does) and stops background checks **before** calling `on_failure`, so the grace period cannot keep the app running on it. `on_failure` may call `login()` again. |
 | Transient | Everything else: `network_error`, `timeout`, `rate_limited`, `system_error`, `no_credits`, `demo_quota_exceeded`, `app_burn_cap_reached`, `bad_request`, `invalid_key`, every `http_error_<status>`, `invalid_json_response`, `unexpected_response`, `nonce_mismatch`, any unrecognized code | Keeps the session and checks in again on the next `heartbeat_interval`. Once the signed session's TTL has passed, the next transient failure is reported as a fatal `session_expired` instead. |
 
-Transient failures only keep checking in if `on_failure` returns normally. Without a callback, any failure still ends the process with `os._exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
+Transient failures only keep checking in if `on_failure` returns normally. Without a callback, a transient failure prints `AuthForge: background check failed (<code>); retrying next interval` to stderr and check-ins continue; a fatal one, including the `session_expired` a transient failure becomes once the session TTL has passed, still ends the process with `os._exit(1)`. Heartbeat network failures are reported once, as `heartbeat_failed` with code `network_error` or `timeout`, not as a separate `network_error` reason.
 
 `on_failure` runs on the background heartbeat thread with no SDK lock held, so calling `logout()`, `is_authenticated()` or `login()` from it is safe. A check-in that is still in flight when you call `logout()` or `login()` is discarded: it cannot restore the old session or report a failure for it.
 
-To tolerate short outages but exit on a definitive answer:
+To tolerate short outages but shut down on a definitive answer, have the callback signal your main thread and let the main thread save and exit:
 
 ```python
-import os
 import sys
+import threading
 from authforge import AuthForgeClient, AuthForgeError
+
+license_lost = threading.Event()
 
 def handle_auth_failure(reason, exc):
     if reason == "heartbeat_failed" and isinstance(exc, AuthForgeError) and exc.transient:
@@ -261,8 +263,8 @@ def handle_auth_failure(reason, exc):
         return
     code = exc.code if isinstance(exc, AuthForgeError) else exc
     print(f"License check failed: {reason} ({code})", file=sys.stderr)
-    # on_failure can run on the heartbeat thread, where sys.exit() only ends that thread.
-    os._exit(1)
+    # This can run on the heartbeat thread: signal the main thread instead of exiting here.
+    license_lost.set()
 
 client = AuthForgeClient(
     app_id="YOUR_APP_ID",
@@ -272,7 +274,19 @@ client = AuthForgeClient(
     ttl_seconds=3600,  # retry window for transient check-in failures
     on_failure=handle_auth_failure,
 )
+
+if not client.login(input("License key: ").strip()):
+    sys.exit(1)
+
+while not license_lost.is_set():
+    do_one_unit_of_work()  # keep units short so the loop notices the signal quickly
+
+save_user_work()
+client.logout()
+sys.exit(1)
 ```
+
+If your main thread is blocked (for example in `input()` or a long `time.sleep()`) rather than looping, call `_thread.interrupt_main()` from the callback instead: it raises `KeyboardInterrupt` on the main thread, so your existing `try` / `finally` cleanup runs. `sys.exit()` inside the callback only ends the heartbeat thread. Calling `os._exit(1)` from the callback is a last resort for when the main thread cannot react at all: it skips `finally` blocks, `atexit` handlers and unflushed file writes, so save the user's work first.
 
 ## Self-ban (tamper response)
 

@@ -7,6 +7,7 @@ import re
 import secrets
 import subprocess
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -87,7 +88,7 @@ _ACTIVATION_REQUEST_VERSION = 1
 _ACTIVATION_REQUEST_TYP = "authforge-activation-request"
 _BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----"
 _END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----"
-_SDK_TAG = "python/1.4.0"
+_SDK_TAG = "python/1.4.1"
 _ARMOR_LINE_WIDTH = 64
 _MAX_REQUEST_HWID = 256
 _MAX_REQUEST_MACHINE_NAME = 128
@@ -576,6 +577,17 @@ def is_transient_error(error: Union[str, BaseException, None]) -> bool:
     return code not in DEFINITIVE_ERROR_CODES
 
 
+def _warn(message: str) -> None:
+    # sys.stderr is None under pythonw, and a closed stream must not stop check-ins.
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(message, file=stream, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
 class AuthForgeClient:
     def __init__(
         self,
@@ -985,8 +997,9 @@ class AuthForgeClient:
     def _heartbeat_tick(self) -> bool:
         """Run one background check. Returns ``False`` when the loop must stop.
 
-        Transient failures are reported and the loop keeps checking in on the
-        next interval. Definitive failures drop the stored session first, so
+        Transient failures are reported (a stderr warning when there is no
+        ``on_failure``) and the loop keeps checking in on the next interval.
+        Definitive failures drop the stored session first, so
         neither the grace period nor ``is_authenticated()`` keeps the app
         running on it, and ``on_failure`` may call ``login()`` again.
         ``on_failure`` always runs with no SDK lock held.
@@ -1011,6 +1024,9 @@ class AuthForgeClient:
                 return True
             if error.fatal:
                 self._clear_session_locked()
+        if error.transient and self.on_failure is None:
+            _warn(f"AuthForge: background check failed ({error.code}); retrying next interval")
+            return True
         self._fail("heartbeat_failed", error)
         return error.transient
 

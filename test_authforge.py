@@ -611,10 +611,53 @@ class HeartbeatFailureTests(unittest.TestCase):
         self.assertTrue(exc.fatal)
         self._assert_invalidated()
 
-    def test_without_on_failure_any_failure_exits(self) -> None:
+    def test_without_on_failure_transient_failure_warns_and_keeps_checking_in(self) -> None:
+        for code, side_effect in (
+            ("network_error", urllib.error.URLError("offline")),
+            ("system_error", _failed_response(500, "system_error")),
+        ):
+            with self.subTest(code=code):
+                self._fresh_client()
+                self.client.on_failure = None
+                stderr = io.StringIO()
+                with patch("authforge.os._exit") as exit_mock, patch("authforge.sys.stderr", stderr):
+                    self.assertTrue(self._tick(side_effect))
+                exit_mock.assert_not_called()
+                self.assertEqual(
+                    stderr.getvalue(),
+                    f"AuthForge: background check failed ({code}); retrying next interval\n",
+                )
+                self._assert_session_kept()
+
+    def test_without_on_failure_transient_warning_tolerates_missing_stderr(self) -> None:
+        self.client.on_failure = None
+        with patch("authforge.os._exit") as exit_mock, patch("authforge.sys.stderr", None):
+            self.assertTrue(self._tick(urllib.error.URLError("offline")))
+        exit_mock.assert_not_called()
+        self._assert_session_kept()
+
+    def test_without_on_failure_definitive_failure_exits(self) -> None:
+        for label, expires_in, side_effect in (
+            ("revoked", None, _failed_response(410, "revoked")),
+            ("ttl-promoted session_expired", int(time.time()) - 1, urllib.error.URLError("offline")),
+        ):
+            with self.subTest(case=label):
+                self._fresh_client()
+                self.client.on_failure = None
+                if expires_in is not None:
+                    self.client._session_expires_in = expires_in
+                stderr = io.StringIO()
+                with patch("authforge.os._exit") as exit_mock, patch("authforge.sys.stderr", stderr):
+                    self.assertFalse(self._tick(side_effect))
+                exit_mock.assert_called_once_with(1)
+                self.assertEqual(stderr.getvalue(), "")
+                self._assert_invalidated()
+
+    def test_without_on_failure_login_failure_exits(self) -> None:
         self.client.on_failure = None
         with patch("authforge.os._exit") as exit_mock:
-            self._tick(urllib.error.URLError("offline"))
+            with patch("authforge.urllib.request.urlopen", side_effect=_failed_response(401, "invalid_key")):
+                self.assertFalse(self.client.login("license-key"))
         exit_mock.assert_called_once_with(1)
 
     def test_is_transient_error_classification(self) -> None:

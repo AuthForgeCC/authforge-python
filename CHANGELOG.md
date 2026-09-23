@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.1
+
+### Fixes
+
+- Without an `on_failure` callback, a transient background check failure (network outage, timeout, `rate_limited`, `system_error`, `no_credits`, ...) no longer ends the process. The SDK prints one line to stderr, `AuthForge: background check failed (<code>); retrying next interval`, keeps the session and checks in again on the next interval. Previously a brief outage killed any app that enabled online check-ins without setting a callback.
+- Unchanged: without a callback, definitive failures (including the `session_expired` a transient failure becomes once the session TTL has passed) and failed `login()` calls still call `os._exit(1)`.
+
+### Docs
+
+- The README and `AGENTS.md` examples no longer call `os._exit(1)` from `on_failure`. They set a `threading.Event` that the main thread checks so it can save work and exit, mention `_thread.interrupt_main()` for blocked main threads, and keep `os._exit` as a last resort after saving.
+
 ## 1.4.0
 
 ### Behavior changes for callers

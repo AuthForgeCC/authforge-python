@@ -23,19 +23,23 @@ Prefer **`pip install authforge-sdk`** from [PyPI](https://pypi.org/project/auth
 ## Minimal working integration
 
 ```python
-import os
 import sys
+import threading
 from typing import Optional
 
-from authforge import AuthForgeClient
+from authforge import AuthForgeClient, AuthForgeError
+
+license_lost = threading.Event()
 
 
 def on_failure(reason: str, exc: Optional[Exception]) -> None:
+    if reason == "heartbeat_failed" and isinstance(exc, AuthForgeError) and exc.transient:
+        return  # network blip / rate_limited: the SDK checks in again next interval
     print(f"AuthForge: {reason}", file=sys.stderr)
     if exc is not None:
         print(exc, file=sys.stderr)
-    # on_failure can run on the heartbeat thread, where sys.exit() only ends that thread.
-    os._exit(1)
+    # on_failure can run on the heartbeat thread: signal the main thread instead of exiting here.
+    license_lost.set()
 
 
 def main() -> None:
@@ -51,8 +55,12 @@ def main() -> None:
         sys.exit(1)
     # --- Your application code starts here ---
     print("Running with a valid license.")
+    while not license_lost.is_set():
+        license_lost.wait(1.0)  # replace with short units of work that check license_lost between them
     # --- Your application code ends here ---
+    # Save the user's work here, then stop.
     client.logout()
+    sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -71,7 +79,7 @@ This activates once and then runs through the grace period (no network) until th
 | `heartbeat_mode` | `str \| None` | no | `None` | Deprecated shim: `"LOCAL"` maps to the default (grace period), `"SERVER"` maps to `online_heartbeat=True`. Emits a `DeprecationWarning` when provided (case-insensitive) |
 | `heartbeat_interval` | `int` | no | `900` | Seconds between background checks (minimum `10`); applies to grace period checks and online check-ins |
 | `api_base_url` | `str` | no | `https://auth.authforge.cc` | API base URL |
-| `on_failure` | `Callable[[str, Optional[Exception]], None] \| None` | no | `None` | Called on activation/check-in/network failure; if omitted, process exits via `os._exit(1)` (not used by `validate_license`) |
+| `on_failure` | `Callable[[str, Optional[Exception]], None] \| None` | no | `None` | Called on activation/check-in/network failure (not used by `validate_license`). If omitted, a transient background check failure prints a one-line warning to stderr and check-ins continue; any other failure exits via `os._exit(1)` |
 | `request_timeout` | `int` | no | `15` | HTTP timeout (seconds) |
 | `ttl_seconds` | `int \| None` | no | `None` (server default: 86400) | The grace period duration: how long the app keeps running on the signed session without contacting AuthForge. Server clamps to `[3600, 604800]` (1h to 7d); preserved across check-in refreshes. |
 | `hwid_override` | `str \| None` | no | `None` | Optional custom HWID/subject string. When set to a non-empty value (for example `tg:123456789`), the SDK sends it instead of generating a machine fingerprint. |
@@ -162,11 +170,13 @@ Offline file error codes (in check order): `bad_armor`, `bad_signature`, `unsupp
 Server error codes appear as `AuthForgeError` (a `ValueError` subclass) in the `exc` passed to `on_failure`: `exc.code` is the code (e.g. `invalid_key`, `revoked`, `hwid_mismatch`), `str(exc)` the message. Reasons are `login_failed`, `heartbeat_failed`, `network_error` (login only), or `offline_login_failed`. For `heartbeat_failed`, `exc` is always an `AuthForgeError`; use `exc.transient` to tolerate outages.
 
 ```python
-import os
 import sys
+import threading
 from typing import Optional
 
 from authforge import AuthForgeError
+
+license_lost = threading.Event()  # the main loop checks this, saves work, then exits
 
 def on_failure(reason: str, exc: Optional[Exception]) -> None:
     if reason == "heartbeat_failed" and isinstance(exc, AuthForgeError) and exc.transient:
@@ -174,14 +184,17 @@ def on_failure(reason: str, exc: Optional[Exception]) -> None:
     code = exc.code if isinstance(exc, AuthForgeError) else exc
     if code in {"invalid_key", "expired", "revoked", "hwid_mismatch", "blocked"}:
         print(f"License issue: {code}", file=sys.stderr)
-    os._exit(1)  # sys.exit() on the heartbeat thread would only end that thread
+    license_lost.set()  # sys.exit() on the heartbeat thread would only end that thread
 ```
+
+If the main thread blocks instead of looping, `_thread.interrupt_main()` from the callback raises `KeyboardInterrupt` there so `try` / `finally` cleanup runs. `os._exit(1)` inside the callback is a last resort: it skips all cleanup, so save the user's work first.
 
 ## Do NOT
 
 - Do not hardcode the app secret as a plain string literal in source: use environment variables or encrypted config
 - Do not embed the App Secret in air-gapped / `login_from_file` builds: pass `None` or `""`; verification only needs app id + public key
-- Do not skip the `on_failure` callback: without it, background check failures terminate the process via `os._exit(1)` without your cleanup
+- Do not skip the `on_failure` callback: without it, transient check-in failures only print a stderr warning, but definitive ones (and a failed `login()`) terminate the process via `os._exit(1)` without your cleanup
+- Do not call `os._exit()` from `on_failure` as the normal shutdown path: signal the main thread (a `threading.Event`, or `_thread.interrupt_main()`) so it can save work and exit cleanly
 - Do not treat every `heartbeat_failed` as a network blip or every one as fatal: check `exc.transient`. Fatal failures have already cleared the session, so do not keep the app running on it
 - Do not call `login()` on every app action: call it once at startup; the grace period (or online check-ins) handles the rest
 - Do not pass `heartbeat_mode` in new code: it is deprecated. Use the default grace period, or `online_heartbeat=True` when you need fast revocation or concurrent-use detection
