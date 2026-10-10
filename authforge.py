@@ -88,7 +88,7 @@ _ACTIVATION_REQUEST_VERSION = 1
 _ACTIVATION_REQUEST_TYP = "authforge-activation-request"
 _BEGIN_ACTIVATION_REQUEST = "-----BEGIN AUTHFORGE ACTIVATION REQUEST-----"
 _END_ACTIVATION_REQUEST = "-----END AUTHFORGE ACTIVATION REQUEST-----"
-_SDK_TAG = "python/1.4.1"
+_SDK_TAG = "python/1.5.0"
 _ARMOR_LINE_WIDTH = 64
 _MAX_REQUEST_HWID = 256
 _MAX_REQUEST_MACHINE_NAME = 128
@@ -477,6 +477,33 @@ def _verify_offline_signature(payload_base64: str, signature_base64: str, keys: 
     return False
 
 
+def _write_file_atomic(path: str, data: bytes) -> None:
+    """Write ``data`` byte-for-byte to ``path`` via a temp file in the same
+    directory and ``os.replace``, creating parent directories. A failure never
+    leaves a partial file at ``path`` or changes an existing one."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    tmp_path = os.path.join(
+        directory, f".{os.path.basename(path)}.{secrets.token_hex(8)}.tmp"
+    )
+    # O_BINARY (Windows only) keeps the bytes exact; mode 0o666 lets the umask
+    # apply as for a normal open().
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp_path, flags, 0o666)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 KNOWN_SERVER_ERRORS = {
     "invalid_app",
     "invalid_key",
@@ -495,6 +522,14 @@ KNOWN_SERVER_ERRORS = {
     "malformed_request",
     "demo_quota_exceeded",
     "system_error",
+    # POST /auth/offline/activate (self-serve offline activation).
+    "offline_activation_disabled",
+    "offline_activation_requires_perpetual",
+    "offline_activation_requires_seats",
+    "offline_activation_limit_reached",
+    # SDK code (never sent by the server): the returned file failed local
+    # verification. Listed with the server codes for cross-SDK parity.
+    "offline_file_rejected",
 }
 
 # Well-formed AuthForge verdicts that end the session. This is the only list
@@ -510,6 +545,12 @@ DEFINITIVE_ERROR_CODES = frozenset(
         "app_disabled",
         "invalid_app",
         "signature_mismatch",
+        "offline_activation_disabled",
+        "offline_activation_requires_perpetual",
+        "offline_activation_requires_seats",
+        "offline_activation_limit_reached",
+        # SDK code: activate_offline() got a file that failed local verification.
+        "offline_file_rejected",
     }
 )
 
@@ -536,6 +577,9 @@ TRANSIENT_ERROR_CODES = frozenset(
         "missing_session_token",
         "nonce_mismatch",
         "unknown_error",
+        # activate_offline() could not write the verified file; activating the
+        # same machine again is free.
+        "file_write_failed",
     }
 )
 _SERVER_ERROR_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -769,6 +813,71 @@ class AuthForgeClient:
         self._apply_offline_license(result)
         return True
 
+    def activate_offline(self, license_key: str, path: Optional[str] = None) -> bool:
+        """Self-serve offline activation: turn a license key into a lifetime,
+        HWID-bound ``.authforge`` file with one online call
+        (``POST /auth/offline/activate``).
+
+        Needs the App Secret (unlike air-gapped builds). The server charges the
+        app owner 2 credits for a new machine; the same machine activating
+        again gets the identical file back for free. The returned file is
+        verified locally (signature, app id, this client's HWID) before
+        anything is written. When ``path`` is set the file is written there
+        atomically, creating parent directories. On success the client is
+        authenticated exactly as after :meth:`login_from_file`, and
+        ``get_offline_license()["replay"]`` tells whether the server returned
+        a file this machine already had.
+
+        Raises :class:`AuthForgeError` on any refusal: ``exc.code`` is the
+        server code, ``offline_file_rejected`` (the message carries the
+        verifier's reason), ``file_write_failed`` or a network code. Never
+        calls ``on_failure`` or ``os._exit``. On failure nothing is written to
+        ``path`` and the client is not authenticated by this call; an existing
+        session is kept. On success the session is replaced, as with
+        :meth:`login_from_file`.
+        """
+        if not license_key or not isinstance(license_key, str):
+            raise ValueError("license_key must be a non-empty string")
+        self._require_app_secret()
+        target = os.fspath(path) if path else None
+        body: Dict[str, Any] = {
+            "appId": self.app_id,
+            "appSecret": self.app_secret,
+            "licenseKey": license_key,
+            "hwid": self._hwid,
+            "nonce": self._generate_nonce(),
+        }
+        try:
+            # skip_failure_hook: a network failure must raise here, never
+            # reach on_failure / os._exit.
+            response_obj = self._post_json("/auth/offline/activate", body, skip_failure_hook=True)
+        except AuthForgeError:
+            raise
+        except Exception as exc:
+            raise AuthForgeError("network_error", f"network_error: {exc}") from exc
+        if not self._is_success_status(response_obj.get("status")):
+            raise self._heartbeat_verdict(response_obj)
+        file_text = response_obj.get("file")
+        if not isinstance(file_text, str) or not file_text:
+            raise AuthForgeError("unexpected_response", "unexpected_response: missing file")
+
+        # The verifier's reason goes in the message only: the server's
+        # hwid_mismatch means "no free seat" and must stay distinguishable.
+        result = verify_license_file(file_text, self.app_id, self.public_keys, self._hwid)
+        if not result["ok"]:
+            raise AuthForgeError(
+                "offline_file_rejected", f"offline_file_rejected: {result['error']}"
+            )
+
+        if target is not None:
+            try:
+                _write_file_atomic(target, file_text.encode("utf-8"))
+            except OSError as exc:
+                raise AuthForgeError("file_write_failed", f"file_write_failed: {exc}") from exc
+
+        self._apply_offline_license(result, replay=response_obj.get("replay") is True)
+        return True
+
     def verify_license_file(
         self,
         path_or_text: str,
@@ -798,7 +907,9 @@ class AuthForgeClient:
         with open(path_or_text, "r", encoding="utf-8") as handle:
             return handle.read()
 
-    def _apply_offline_license(self, result: VerifyLicenseFileSuccess) -> None:
+    def _apply_offline_license(
+        self, result: VerifyLicenseFileSuccess, *, replay: Optional[bool] = None
+    ) -> None:
         # Stop any online session first so the two modes never overlap.
         self.logout()
         lic = result["license"]
@@ -830,6 +941,10 @@ class AuthForgeClient:
                 summary["label"] = lic["label"]
             if "license_expires_at" in lic:
                 summary["license_expires_at"] = lic["license_expires_at"]
+            if replay is not None:
+                # Only set by activate_offline(): True when the server returned
+                # the file this machine already had (free).
+                summary["replay"] = replay
             self._offline_license = summary
             self._authenticated = True
 

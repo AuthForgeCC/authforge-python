@@ -671,6 +671,11 @@ class HeartbeatFailureTests(unittest.TestCase):
             "app_disabled",
             "invalid_app",
             "signature_mismatch",
+            "offline_activation_disabled",
+            "offline_activation_requires_perpetual",
+            "offline_activation_requires_seats",
+            "offline_activation_limit_reached",
+            "offline_file_rejected",
         }
         self.assertEqual(authforge.DEFINITIVE_ERROR_CODES, definitive)
         self.assertEqual(authforge.TRANSIENT_ERROR_CODES & definitive, frozenset())
@@ -1123,6 +1128,356 @@ class ActivationRequestTests(unittest.TestCase):
                 ),
             )
 
+
+
+def _load_self_serve_vectors() -> dict:
+    path = Path(__file__).resolve().parent / "self_serve_activation_vectors.json"
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+class SelfServeActivationTests(unittest.TestCase):
+    """activate_offline() against the shared self_serve_activation_vectors.json."""
+
+    BASE_URL = "https://auth.test"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.vectors = _load_self_serve_vectors()
+        cls.config = cls.vectors["config"]
+        cls.by_name = {c["name"]: c for c in cls.vectors["cases"]}
+
+    def setUp(self) -> None:
+        # rate_limited retries sleep 2s + 5s in production; make them instant.
+        sleep_patch = patch("authforge.time.sleep")
+        self.sleep = sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
+        exit_patch = patch("authforge.os._exit", side_effect=AssertionError("os._exit must never be called"))
+        self.exit = exit_patch.start()
+        self.addCleanup(exit_patch.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def _make_client(self, **overrides) -> tuple[AuthForgeClient, list]:
+        failures: list = []
+        kwargs = dict(
+            app_id=self.config["appId"],
+            app_secret=self.config["appSecret"],
+            public_key=self.config["publicKey"],
+            hwid_override=self.config["hwid"],
+            api_base_url=self.BASE_URL,
+            on_failure=lambda reason, exc: failures.append((reason, exc)),
+        )
+        kwargs.update(overrides)
+        return AuthForgeClient(**kwargs), failures
+
+    @staticmethod
+    def _server(status: int, body: dict, requests: list):
+        """urlopen side effect answering every call with ``status``/``body``."""
+        raw = json.dumps(body).encode("utf-8")
+
+        def side_effect(request, *_args, **_kwargs):
+            requests.append(request)
+            if status >= 400:
+                raise urllib.error.HTTPError(request.full_url, status, "err", {}, io.BytesIO(raw))
+            resp = MagicMock()
+            resp.status = status
+            resp.read.return_value = raw
+            cm = MagicMock()
+            cm.__enter__.return_value = resp
+            cm.__exit__.return_value = None
+            return cm
+
+        return side_effect
+
+    def _activate(self, client: AuthForgeClient, case: dict, path: Path):
+        requests: list = []
+        response = case["response"]
+        with patch(
+            "authforge.urllib.request.urlopen",
+            side_effect=self._server(response["status"], response["body"], requests),
+        ):
+            try:
+                return client.activate_offline(self.config["licenseKey"], path=str(path)), None, requests
+            except authforge.AuthForgeError as exc:
+                return None, exc, requests
+
+    def _assert_request(self, client: AuthForgeClient, request) -> dict:
+        spec = self.vectors["request"]
+        self.assertEqual(request.get_method(), spec["method"])
+        self.assertEqual(request.full_url, self.BASE_URL + spec["path"])
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(sorted(body), sorted(spec["bodyFields"]))
+        self.assertEqual(body["appId"], self.config["appId"])
+        self.assertEqual(body["appSecret"], self.config["appSecret"])
+        self.assertEqual(body["licenseKey"], self.config["licenseKey"])
+        self.assertEqual(body["hwid"], self.config["hwid"])
+        self.assertEqual(body["hwid"], client.get_hwid())
+        self.assertRegex(body["nonce"], r"^[0-9a-f]{32}$")
+        return body
+
+    def _assert_unauthenticated(self, client: AuthForgeClient) -> None:
+        self.assertFalse(client.is_authenticated())
+        self.assertIsNone(client.get_session_kind())
+        self.assertIsNone(client.get_offline_license())
+        self.assertIsNone(client.get_license_variables())
+        self.assertFalse(client._heartbeat_started)
+
+    def _assert_no_temp_files(self, directory: Path) -> None:
+        if directory.exists():
+            self.assertEqual([p.name for p in directory.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_every_vector_case_matches(self) -> None:
+        self.assertGreaterEqual(len(self.vectors["cases"]), 17)
+        for case in self.vectors["cases"]:
+            expect = case["expect"]
+            with self.subTest(case=case["name"]):
+                self.sleep.reset_mock()
+                client, failures = self._make_client()
+                directory = self.tmp / case["name"] / "nested" / "dir"
+                path = directory / "license.authforge"
+                ok, exc, requests = self._activate(client, case, path)
+
+                self.assertGreaterEqual(len(requests), 1)
+                nonces = [self._assert_request(client, r)["nonce"] for r in requests]
+                self.assertEqual(len(set(nonces)), len(nonces), "every retry sends a fresh nonce")
+                self.assertEqual(failures, [], "activate_offline never reports through on_failure")
+                self.exit.assert_not_called()
+                self._assert_no_temp_files(directory)
+
+                if expect["outcome"] == "activated":
+                    self.assertIsNone(exc)
+                    self.assertIs(ok, True)
+                    self.assertEqual(len(requests), 1)
+                    self.assertTrue(expect["writesFile"])
+                    self.assertEqual(path.read_bytes(), expect["fileWritten"].encode("utf-8"))
+                    self.assertTrue(client.is_authenticated())
+                    self.assertEqual(client.get_session_kind(), expect["sessionKind"])
+                    self.assertEqual(client.get_license_variables(), expect["licenseVariables"])
+                    self.assertEqual(client.get_app_variables(), expect["appVariables"])
+                    offline = client.get_offline_license()
+                    assert offline is not None
+                    self.assertIs(offline["replay"], expect["replay"])
+                    self.assertEqual(offline["license_key"], self.config["licenseKey"])
+                    self.assertEqual(offline["jti"], case["response"]["body"]["jti"])
+                    self.assertIsNone(offline["expires_at"])
+                    self.assertIsNone(client._session_token)
+                    self.assertFalse(client._heartbeat_started)
+                    self.assertIsNone(client._heartbeat_thread)
+
+                    # The written file is exactly what login_from_file() accepts.
+                    reader, reader_failures = self._make_client(app_secret=None)
+                    with patch(
+                        "authforge.urllib.request.urlopen",
+                        side_effect=AssertionError("offline files must not use the network"),
+                    ):
+                        self.assertTrue(reader.login_from_file(str(path)))
+                    self.assertEqual(reader_failures, [])
+                    self.assertEqual(reader.get_license_variables(), client.get_license_variables())
+                    self.assertEqual(reader.get_session_data(), client.get_session_data())
+                else:
+                    self.assertIsNone(ok)
+                    assert exc is not None
+                    self.assertFalse(expect["writesFile"])
+                    self.assertEqual(exc.code, expect["errorCode"])
+                    self.assertEqual(exc.fatal, expect["fatal"])
+                    self.assertEqual(exc.transient, not expect["fatal"])
+                    self.assertEqual(authforge.is_transient_error(exc.code), not expect["fatal"])
+                    if "detail" in expect:
+                        self.assertIn(expect["detail"], str(exc))
+                    self.assertFalse(path.exists())
+                    self._assert_unauthenticated(client)
+                    if expect["errorCode"] == "rate_limited":
+                        self.assertEqual(len(requests), 3)
+                        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [2, 5])
+                    else:
+                        self.assertEqual(len(requests), 1)
+                        self.sleep.assert_not_called()
+
+    def test_error_leaves_existing_file_untouched(self) -> None:
+        previous = b"previous license bytes\r\nkeep me\n"
+        for case in self.vectors["cases"]:
+            if case["expect"]["outcome"] != "error":
+                continue
+            with self.subTest(case=case["name"]):
+                path = self.tmp / f"{case['name']}.authforge"
+                path.write_bytes(previous)
+                client, _ = self._make_client()
+                ok, exc, _ = self._activate(client, case, path)
+                self.assertIsNone(ok)
+                self.assertIsNotNone(exc)
+                self.assertEqual(path.read_bytes(), previous)
+        self._assert_no_temp_files(self.tmp)
+
+    def test_success_replaces_existing_file(self) -> None:
+        case = self.by_name["activated_new_machine"]
+        path = self.tmp / "license.authforge"
+        path.write_bytes(b"stale")
+        client, _ = self._make_client()
+        ok, exc, _ = self._activate(client, case, path)
+        self.assertIsNone(exc)
+        self.assertTrue(ok)
+        self.assertEqual(path.read_bytes(), case["expect"]["fileWritten"].encode("utf-8"))
+        self._assert_no_temp_files(self.tmp)
+
+    def test_without_path_authenticates_and_writes_nothing(self) -> None:
+        case = self.by_name["activated_replay"]
+        client, _ = self._make_client()
+        requests: list = []
+        response = case["response"]
+        with patch(
+            "authforge.urllib.request.urlopen",
+            side_effect=self._server(response["status"], response["body"], requests),
+        ):
+            self.assertTrue(client.activate_offline(self.config["licenseKey"]))
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(client.get_session_kind(), "offline")
+        offline = client.get_offline_license()
+        assert offline is not None
+        self.assertIs(offline["replay"], True)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_login_from_file_summary_has_no_replay_flag(self) -> None:
+        client, _ = self._make_client(app_secret=None)
+        self.assertTrue(client.login_from_file(self.by_name["activated_new_machine"]["expect"]["fileWritten"]))
+        offline = client.get_offline_license()
+        assert offline is not None
+        self.assertNotIn("replay", offline)
+
+    def test_missing_app_secret_fails_fast_without_a_request(self) -> None:
+        for secret in (None, ""):
+            with self.subTest(secret=secret):
+                client, failures = self._make_client(app_secret=secret)
+                path = self.tmp / "never" / "license.authforge"
+                with patch(
+                    "authforge.urllib.request.urlopen",
+                    side_effect=AssertionError("must not reach the network"),
+                ) as urlopen:
+                    with self.assertRaises(ValueError) as ctx:
+                        client.activate_offline(self.config["licenseKey"], path=str(path))
+                urlopen.assert_not_called()
+                self.assertIn("app_secret is required for online APIs", str(ctx.exception))
+                self.assertFalse(path.parent.exists())
+                self.assertEqual(failures, [])
+                self._assert_unauthenticated(client)
+
+    def test_sends_the_same_hwid_as_login(self) -> None:
+        # Real fingerprint (no override): the HWID login() sends must be the one
+        # activate_offline() sends, or the file is bound to the wrong machine.
+        client, _ = self._make_client(hwid_override=None)
+        bodies: dict = {}
+        for path, call in (
+            ("/auth/validate", lambda: client.login(self.config["licenseKey"])),
+            ("/auth/offline/activate", lambda: client.activate_offline(self.config["licenseKey"])),
+        ):
+            requests: list = []
+            with patch(
+                "authforge.urllib.request.urlopen",
+                side_effect=self._server(403, {"status": "failed", "error": "blocked"}, requests),
+            ):
+                try:
+                    call()
+                except authforge.AuthForgeError:
+                    pass
+            self.assertEqual(len(requests), 1)
+            self.assertTrue(requests[0].full_url.endswith(path))
+            bodies[path] = json.loads(requests[0].data.decode("utf-8"))
+        self.assertEqual(bodies["/auth/offline/activate"]["hwid"], bodies["/auth/validate"]["hwid"])
+        self.assertEqual(bodies["/auth/offline/activate"]["hwid"], client.get_hwid())
+
+    def test_network_error_raises_without_on_failure_or_exit(self) -> None:
+        client, _ = self._make_client(on_failure=None)
+        path = self.tmp / "license.authforge"
+        with patch("authforge.urllib.request.urlopen", side_effect=urllib.error.URLError("offline")) as urlopen:
+            with self.assertRaises(authforge.AuthForgeError) as ctx:
+                client.activate_offline(self.config["licenseKey"], path=str(path))
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(ctx.exception.code, "network_error")
+        self.assertTrue(ctx.exception.transient)
+        self.exit.assert_not_called()
+        self.assertFalse(path.exists())
+        self._assert_unauthenticated(client)
+
+    def test_definitive_error_without_on_failure_never_exits(self) -> None:
+        client, _ = self._make_client(on_failure=None)
+        case = self.by_name["error_offline_activation_limit_reached"]
+        ok, exc, _ = self._activate(client, case, self.tmp / "license.authforge")
+        self.assertIsNone(ok)
+        assert exc is not None
+        self.assertEqual(exc.code, "offline_activation_limit_reached")
+        self.exit.assert_not_called()
+
+    def test_failure_keeps_an_existing_session(self) -> None:
+        # A failed activation does not log out; it just does not authenticate.
+        good = self.by_name["activated_new_machine"]
+        client, _ = self._make_client()
+        self.assertTrue(client.login_from_file(good["expect"]["fileWritten"]))
+        before = client.get_offline_license()
+        for name in ("error_revoked", "reject_other_hwid", "reject_missing_file"):
+            with self.subTest(case=name):
+                ok, exc, _ = self._activate(client, self.by_name[name], self.tmp / "license.authforge")
+                self.assertIsNone(ok)
+                assert exc is not None
+                self.assertEqual(exc.code, self.by_name[name]["expect"]["errorCode"])
+                self.assertTrue(client.is_authenticated())
+                self.assertEqual(client.get_session_kind(), "offline")
+                self.assertEqual(client.get_offline_license(), before)
+
+    def test_success_replaces_an_existing_session(self) -> None:
+        client, _ = self._make_client()
+        self.assertTrue(client.login_from_file(self.by_name["activated_new_machine"]["expect"]["fileWritten"]))
+        ok, exc, _ = self._activate(client, self.by_name["activated_replay"], self.tmp / "license.authforge")
+        self.assertIsNone(exc)
+        self.assertTrue(ok)
+        offline = client.get_offline_license()
+        assert offline is not None
+        self.assertIs(offline["replay"], True)
+        self.assertEqual(client.get_session_kind(), "offline")
+
+    def test_empty_license_key_is_checked_before_app_secret(self) -> None:
+        client, failures = self._make_client(app_secret=None)
+        with patch(
+            "authforge.urllib.request.urlopen",
+            side_effect=AssertionError("must not reach the network"),
+        ) as urlopen:
+            with self.assertRaises(ValueError) as ctx:
+                client.activate_offline("", path=str(self.tmp / "license.authforge"))
+        urlopen.assert_not_called()
+        self.assertIn("license_key", str(ctx.exception))
+        self.assertNotIn("app_secret", str(ctx.exception))
+        self.assertEqual(failures, [])
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_write_failure_is_reported_and_leaves_client_unauthenticated(self) -> None:
+        case = self.by_name["activated_new_machine"]
+        client, failures = self._make_client()
+        # A directory where the file should go: os.replace() cannot overwrite it.
+        path = self.tmp / "license.authforge"
+        path.mkdir()
+        ok, exc, _ = self._activate(client, case, path)
+        self.assertIsNone(ok)
+        assert exc is not None
+        self.assertEqual(exc.code, "file_write_failed")
+        self.assertTrue(exc.transient)
+        self.assertTrue(path.is_dir())
+        self.assertEqual(failures, [])
+        self._assert_no_temp_files(self.tmp)
+        self._assert_unauthenticated(client)
+
+    def test_new_codes_are_known_and_fatal(self) -> None:
+        for code in (
+            "offline_activation_disabled",
+            "offline_activation_requires_perpetual",
+            "offline_activation_requires_seats",
+            "offline_activation_limit_reached",
+            "offline_file_rejected",
+        ):
+            self.assertIn(code, authforge.KNOWN_SERVER_ERRORS)
+            self.assertIn(code, authforge.DEFINITIVE_ERROR_CODES)
+        self.assertTrue(authforge.is_transient_error("unexpected_response"))
+        self.assertTrue(authforge.is_transient_error("file_write_failed"))
 
 if __name__ == "__main__":
     unittest.main()
